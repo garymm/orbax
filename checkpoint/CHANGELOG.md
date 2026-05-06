@@ -7,6 +7,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.11.39] - 2026-05-06
+
+### Added
+
+- Tensorstore non-atomic file I/O locking on local/POSIX-compatible filesystems
+to avoid unnecessary renames.
+
 ## [0.11.38] - 2026-05-05
 
 ### Fixed
