@@ -257,6 +257,61 @@ class BuildArrayTSpecForWriteTest(parameterized.TestCase):
     )
     self.assertEqual(json_tspec['kvstore']['path'], self.param_name)
 
+  def test_ocdbt_kvstore_with_non_atomic_locking(self) -> None:
+    tspec = self.array_write_spec_constructor(
+        directory=self.directory,
+        relative_array_filename=self.param_name,
+        use_zarr3=False,
+        use_ocdbt=True,
+        process_id=13,
+    )
+    self.assertTrue(tspec.metadata.use_ocdbt)
+    json_tspec = tspec.json
+    kvstore_tspec = json_tspec['kvstore']
+    self.assertEqual(kvstore_tspec['driver'], 'ocdbt')
+
+    base_spec = kvstore_tspec['base']
+    if isinstance(base_spec, dict) and 'file_io_locking' in base_spec:
+      self.assertEqual(base_spec['driver'], 'file')
+      self.assertEqual(base_spec['file_io_locking'], {'mode': 'non_atomic'})
+      self.assertEqual(
+          base_spec['path'],
+          os.path.join(self.directory, 'ocdbt.process_13'),
+      )
+      self.assertEqual(kvstore_tspec['path'], self.param_name)
+      self.assertEqual(
+          kvstore_tspec['target_data_file_size'],
+          ts_utils._DEFAULT_OCDBT_TARGET_DATA_FILE_SIZE,
+      )
+      self.assertIn('manifest', kvstore_tspec)
+      manifest_spec = kvstore_tspec['manifest']
+      self.assertEqual(manifest_spec['driver'], ts_utils.DEFAULT_DRIVER)
+      self.assertNotIn('file_io_locking', manifest_spec)
+    else:
+      self.assertNotIn('manifest', kvstore_tspec)
+
+  def test_ocdbt_kvstore_with_non_atomic_locking_gcs_path(self) -> None:
+    tspec = self.array_write_spec_constructor(
+        directory='gs://gcs_bucket/object_path',
+        relative_array_filename=self.param_name,
+        use_zarr3=False,
+        use_ocdbt=True,
+        process_id=0,
+    )
+    self.assertTrue(tspec.metadata.use_ocdbt)
+    kvstore_tspec = tspec.json['kvstore']
+    self.assertEqual(kvstore_tspec['driver'], 'ocdbt')
+    self.assertEqual(
+        kvstore_tspec['base'], 'gs://gcs_bucket/object_path/ocdbt.process_0'
+    )
+    self.assertEqual(kvstore_tspec['path'], self.param_name)
+    self.assertEqual(
+        kvstore_tspec['target_data_file_size'],
+        ts_utils._GCS_OCDBT_TARGET_DATA_FILE_SIZE,
+    )
+    self.assertNotIn('manifest', kvstore_tspec)
+
+
   @parameterized.named_parameters(
       dict(
           testcase_name='regular_path',

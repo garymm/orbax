@@ -164,7 +164,6 @@ def build_kvstore_tspec(
   # fix the path prefix to add back the stripped '/'.
   directory = os.path.normpath(directory).replace('gs:/', 'gs://')
   is_gcs_path = directory.startswith('gs://')
-  kv_spec = {}
 
   if use_ocdbt:
     if not is_gcs_path and not os.path.isabs(directory):
@@ -190,10 +189,39 @@ def build_kvstore_tspec(
         if is_gcs_path
         else {'driver': default_driver, 'path': str(directory)}
     )
-    kv_spec.update({
-        'driver': 'ocdbt',
-        'base': base_driver_spec,
-    })
+    # For OCDBT on local filesystems (including GCSFuse), we can safely use
+    # non-atomic writes for data files to avoid expensive renames. However,
+    # the manifest file still requires atomic writes to avoid corruption.
+    # We achieve this by splitting the spec into 'base' (for data files) and
+    # 'manifest'.
+    try:
+      resolved_base_spec = ts.KvStore.Spec(base_driver_spec).to_json()
+    except Exception:  # pylint: disable=broad-except
+      logging.warning(
+          'Failed to resolve base spec %r, falling back to default.',
+          base_driver_spec,
+          exc_info=True,
+      )
+      resolved_base_spec = base_driver_spec
+
+    if (
+        isinstance(resolved_base_spec, dict)
+        and resolved_base_spec.get('driver') == 'file'
+    ):
+      kv_spec = {
+          'driver': 'ocdbt',
+          'base': {
+              **resolved_base_spec,
+              'file_io_locking': {'mode': 'non_atomic'},
+          },
+          'manifest': base_driver_spec,
+      }
+    else:
+      kv_spec = {
+          'driver': 'ocdbt',
+          'base': base_driver_spec,
+      }
+
     if name is not None:
       kv_spec['path'] = name
 
