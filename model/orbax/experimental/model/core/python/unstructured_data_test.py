@@ -112,6 +112,16 @@ class UnstructuredDataTest(absltest.TestCase):
     with open(os.path.join(dirname, filename), "rb") as f:
       self.assertEqual(f.read(), b"hello")
 
+  def test_write_inlined_data_to_file_traversal(self):
+    proto = unstructured_data.UnstructuredData()
+    proto.inlined_string = "hello"
+    dirname = self.create_tempdir().full_path
+    filename = "../data.txt"
+    with self.assertRaisesRegex(
+        ValueError, "contains directory traversal component"
+    ):
+      unstructured_data.write_inlined_data_to_file(proto, dirname, filename)
+
   def test_maybe_write_location_pointer_to_file(self):
     proto = unstructured_data.UnstructuredData()
     proto.file_system_location.string_path = "path/to/file"
