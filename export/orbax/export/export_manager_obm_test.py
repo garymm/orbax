@@ -18,6 +18,7 @@ import os
 
 from absl.testing import absltest
 from absl.testing import parameterized
+from google.protobuf import text_format
 from orbax.export import constants
 from orbax.export import export_manager
 from orbax.export import export_testing_utils

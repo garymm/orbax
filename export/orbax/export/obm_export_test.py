@@ -21,6 +21,7 @@ from unittest import mock
 
 from absl.testing import absltest
 from absl.testing import parameterized
+from google.protobuf import text_format
 import jax
 import jax.numpy as jnp
 from jaxtyping import PyTree
