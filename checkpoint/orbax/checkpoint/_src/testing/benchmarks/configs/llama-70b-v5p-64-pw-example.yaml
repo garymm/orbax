@@ -1,0 +1,23 @@
+# The name for the entire test suite run.
+suite_name: "Llama 3.1 70B v5p-64"
+num_repeats: 5
+
+mesh_configs:
+  - mesh_axes: ["data", "fsdp", "tensor"]
+    ici_parallelism: {"data": 1, "fsdp": 32, "tensor": 1}
+
+# The checkpoint configuration, shared across all generated benchmarks.
+checkpoint_configs:
+  - path: "gs://orbax-benchmarks/checkpoints/llama-3.1-70B-checkpoints/0/items"
+    sharding_config_path: "gs://orbax-benchmarks/sharding-configs/llama3.1-70b-v5p-64-data-1-fsdp-32-tensor-1/abstract_state.json"
+    load_with_colocated_python: true
+
+benchmarks:
+  - generator: "orbax.checkpoint._src.testing.benchmarks.pytree_checkpoint_benchmark.PyTreeCheckpointBenchmark"
+    options:
+      async_enabled: true
+      use_ocdbt: true
+      use_zarr3: true
+      use_replica_parallel: false
+      use_compression: true
+      use_colocated_python: true

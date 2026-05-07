@@ -23,10 +23,12 @@ import jax
 import jax.numpy as jnp
 import numpy as np
 from orbax.checkpoint import checkpoint_utils
+from orbax.checkpoint import pathways
 from orbax.checkpoint._src.arrays import abstract_arrays
 from orbax.checkpoint._src.arrays import sharding as sharding_utils
 from orbax.checkpoint._src.checkpointers import checkpointer
 from orbax.checkpoint._src.handlers import pytree_checkpoint_handler
+from orbax.checkpoint._src.multihost import multihost
 from orbax.checkpoint._src.serialization import type_handlers
 from orbax.checkpoint._src.testing.benchmarks.core import configs
 from orbax.checkpoint._src.tree import utils as tree_utils
@@ -213,6 +215,16 @@ def load_checkpoint(config: configs.CheckpointConfig) -> Any:
   use_ocdbt = type_handlers.is_ocdbt_checkpoint(path)
   abstract_state = _get_abstract_state(config, use_ocdbt=use_ocdbt)
   restore_args = checkpoint_utils.construct_restore_args(abstract_state)
+
+  if multihost.is_pathways_backend():
+    checkpointing_impl = pathways.CheckpointingImpl.from_options(
+        use_colocated_python=config.load_with_colocated_python,
+    )
+    pathways.register_type_handlers(
+        checkpointing_impl=checkpointing_impl,
+        use_replica_parallel=False,
+        enable_replica_parallel_separate_folder=False,
+    )
 
   with checkpointer.Checkpointer(
       pytree_checkpoint_handler.PyTreeCheckpointHandler(use_ocdbt=use_ocdbt)

@@ -13,6 +13,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 - Tensorstore non-atomic file I/O locking on local/POSIX-compatible filesystems
 to avoid unnecessary renames.
+- Add loading source checkpoint with Pathways colocated-Python in Benchmark
+suite.
 
 ## [0.11.38] - 2026-05-05
 

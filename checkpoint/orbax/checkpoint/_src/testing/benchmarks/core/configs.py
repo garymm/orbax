@@ -81,12 +81,15 @@ class CheckpointConfig:
         1024], 'sharding': ['data', 'model']  # PartitionSpec }, 'step': 'int' }
       sharding_config_path: A path to a file containing sharding specifications,
         used alongside `path`. See above.
+      load_with_colocated_python: If True, the checkpoint will be loaded with
+        colocated Python.  Only effective in Pathways and `path` is specified.
   """
 
   path: str | None = None
   random_seed: int = 0
   spec: dict[str, Any] | None = None
   sharding_config_path: str | None = None
+  load_with_colocated_python: bool = False
 
   def __post_init__(self):
     if self.path is not None and self.spec is not None:
