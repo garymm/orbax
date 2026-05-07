@@ -53,8 +53,6 @@ from orbax.checkpoint._src.serialization import type_handler_registry
 from orbax.checkpoint._src.serialization import type_handlers
 from orbax.checkpoint._src.testing import test_tree_utils
 
-from .privacy.minimization.access_event_logger.gdm import gdm_access_logger
-from .pyglib import gfile
 
 
 PyTreeCheckpointHandler = pytree_checkpoint_handler.PyTreeCheckpointHandler
@@ -136,11 +134,6 @@ class CheckpointerTestBase:
       if isinstance(checkpointer, AsyncCheckpointer):
         checkpointer.wait_until_finished()
 
-    def is_world_readable(self, path):
-      if not gfile.Exists(path):
-        return False
-      mode = gfile.Stat(path, stat_proto=True).mode
-      return (mode & 0o770) != mode
 
     def test_save_restore(self):
       """Basic save and restore test."""
@@ -194,7 +187,6 @@ class CheckpointerTestBase:
         )
         expected = self.pytree
         test_utils.assert_tree_equal(self, expected, restored)
-        self.assertFalse(self.is_world_readable(self.directory))
 
     def test_overwrite_existing(self):
       """Test overwrite existing path."""
@@ -208,7 +200,6 @@ class CheckpointerTestBase:
         )
         expected = self.doubled_pytree
         test_utils.assert_tree_equal(self, expected, restored)
-        self.assertFalse(self.is_world_readable(self.directory))
 
     def test_flax_train_state(self):
       """Test using flax model."""
@@ -797,25 +788,3 @@ class CheckpointerTestBase:
           )
           test_utils.assert_tree_equal(self, expected, restored)
 
-    def test_restore_logs_read_event(self):
-      """Tests that restore logs a read event to DM Sawmill log."""
-      with self.checkpointer(PyTreeCheckpointHandler()) as checkpointer:
-        checkpointer.save(self.directory, self.pytree)
-        self.wait_if_async(checkpointer)
-
-        with mock.patch.object(
-            gdm_access_logger, 'GdmAccessLogger', autospec=True
-        ) as mock_gdm_access_logger:
-          # Create instance of GdmAccessLogger mock.
-          mock_instance = mock_gdm_access_logger()
-
-          restored = checkpointer.restore(
-              self.directory, restore_args=self.pytree_restore_args
-          )
-
-          mock_instance.read_event.assert_called_with(
-              checkpoint_path=str(self.directory),
-              log_provenance='orbax',
-          )
-
-        test_utils.assert_tree_equal(self, self.pytree, restored)
