@@ -12,6 +12,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - Expose `merge_trees` publicly: this function can be use to merge trees into a
 single tree using a comprehensive recursive strategy
 - A set of checkpoint transformation utils.
+- Fix an issue where `SingleReplicaCheckpointHandler` can not be used when an
+  active mesh is present.
 
 ### Changed
 - The PyPi `orbax` package is deprecated in favor of domain-specific namespace

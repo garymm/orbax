@@ -216,6 +216,39 @@ class UtilsTest(parameterized.TestCase):
     )
     self.assertEqual(num_broadcasts, 2)
 
+  def test_globalize_single_replica_arrays_under_active_mesh(self):
+    if len(jax.devices()) < 2:
+      self.skipTest('Need at least 2 devices for this test')
+
+    num_devices_per_replica = len(jax.devices()) // 2
+    arr = [
+        np.arange(2 * num_devices_per_replica).reshape(
+            (2, num_devices_per_replica)
+        )
+    ]
+    arrays, mesh, _ = setup_replica_sharded_arrays(
+        arr, (2, num_devices_per_replica)
+    )
+    sharded_arr = arrays[0]
+    replica_axis_index = 0
+
+    _, primary_replica_pids = multislice.get_primary_replica_ids_and_pids(
+        replica_axis_idx=replica_axis_index,
+        mesh=mesh,
+        primary_replica_id=0,
+    )
+    is_source = multihost.process_index() in primary_replica_pids
+
+    with mesh:
+      result = multislice._globalize_single_replica_arrays(
+          inp=sharded_arr,
+          replica_axis_index=replica_axis_index,
+          global_mesh=mesh,
+          is_source=is_source,
+      )
+      expected_shape = (2,) + sharded_arr.shape
+      self.assertEqual(result.shape, expected_shape)
+
 
 class ProcessReplicaAssignmentTest(parameterized.TestCase):
 
