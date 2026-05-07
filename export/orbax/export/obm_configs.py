@@ -308,6 +308,7 @@ class Jax2ObmOptions:
       layout for model parameters to improve serving performance.
     native_serialization_disabled_checks: A sequence of
       `jax_export.DisabledSafetyCheck` to disable when exporting.
+    save_shlo_to_file: Whether to save the StableHLO bytes as an external file.
   """
 
   # TODO: b/448900820 - Consider constraint the type to the proto enums.
@@ -325,6 +326,7 @@ class Jax2ObmOptions:
   native_serialization_disabled_checks: Sequence[
       jax_export.DisabledSafetyCheck
   ] = ()
+  save_shlo_to_file: bool = False
 
 
 @dataclasses.dataclass(kw_only=True)

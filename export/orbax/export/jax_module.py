@@ -369,3 +369,13 @@ class JaxModule(orbax_module_base.OrbaxModuleBase):
     return cast(
         tensorflow_module.TensorFlowModule, self._export_module
     ).obm_module_to_jax_exported_map(model_inputs)
+
+  @property
+  def save_shlo_to_file(self) -> bool:
+    """Returns True if StableHLO should be saved as an external file."""
+    if self._export_version == constants.ExportModelType.TF_SAVEDMODEL:
+      raise TypeError(
+          'save_shlo_to_file is not implemented for export version'
+          ' ExportModelType.TF_SAVEDMODEL.'
+      )
+    return cast(obm_module.ObmModule, self._export_module).save_shlo_to_file

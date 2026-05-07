@@ -34,6 +34,7 @@ def _build_function(
     target_dir: str,
     name: str,
     visibility: manifest_pb2.Visibility,
+    save_shlo_to_file: bool = False,
 ) -> manifest_pb2.Function:
   """Builds a `manifest_pb2.Function` proto from a `function.Function` object."""
 
@@ -52,11 +53,23 @@ def _build_function(
   if isinstance(fn, shlo_function.ShloFunction):
     stable_hlo_body = fn_proto.body.stable_hlo_body
 
-    # TODO(b/356174487): allow customized `file_system_location`,
-    #   `mime_type`, `version`.
-    stable_hlo_body.stable_hlo.inlined_bytes = fn.mlir_module_serialized
-    stable_hlo_body.stable_hlo.mime_type = "application/x.mlir-stablehlo"
-    stable_hlo_body.stable_hlo.version = "1.0"
+    if save_shlo_to_file:
+      shlo_data = manifest_pb2.UnstructuredData(
+          inlined_bytes=fn.mlir_module_serialized,
+          mime_type="application/x.mlir-stablehlo",
+          version="1.0",
+      )
+      filename = unstructured_data.build_relative_filepath_from_extension(
+          name, "shlo"
+      )
+      shlo_file_data = unstructured_data.write_inlined_data_to_file(
+          shlo_data, target_dir, filename
+      )
+      stable_hlo_body.stable_hlo.CopyFrom(shlo_file_data)
+    else:
+      stable_hlo_body.stable_hlo.inlined_bytes = fn.mlir_module_serialized
+      stable_hlo_body.stable_hlo.mime_type = "application/x.mlir-stablehlo"
+      stable_hlo_body.stable_hlo.version = "1.0"
     stable_hlo_body.calling_convention_version = fn.calling_convention_version
 
     for lowering_platform in fn.lowering_platforms:
@@ -140,6 +153,7 @@ def build_manifest_proto(
     device_assignments: (
         Sequence[device_assignment.DeviceAssignment] | None
     ) = None,
+    save_shlo_to_file: bool = False,
 ) -> manifest_pb2.Manifest:
   """Builds a manifest proto from an OBM module."""
 
@@ -152,7 +166,7 @@ def build_manifest_proto(
 
     if isinstance(obj, function.Function):
       manifest.objects[name].function.CopyFrom(
-          _build_function(obj, target_dir, name, visibility)
+          _build_function(obj, target_dir, name, visibility, save_shlo_to_file)
       )
 
     elif _is_seq_of_functions(obj):
@@ -162,6 +176,7 @@ def build_manifest_proto(
               target_dir,
               f"__{name}_{i}",
               visibility,
+              save_shlo_to_file,
           )
           for i, fn in enumerate(obj)
       ]

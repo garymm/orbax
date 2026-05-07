@@ -75,6 +75,7 @@ class SaveOptions:
   device_assignment_by_coords: (
       Sequence[device_assignment.DeviceAssignment] | None
   ) = None
+  save_shlo_to_file: bool = False
 
 
 def save(
@@ -101,6 +102,7 @@ def save(
       supplementals=supplemental_info,
       visibilities=options.visibility,
       device_assignments=options.device_assignment_by_coords,
+      save_shlo_to_file=options.save_shlo_to_file,
   )
 
   manifest_path = os.path.join(

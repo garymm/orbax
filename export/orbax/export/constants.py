@@ -89,6 +89,9 @@ PERSIST_XLA_FLAGS = 'persist_xla_flags'
 # Adding filter flags once the flag is applied to the pre/post processors.
 ENABLE_BF16_OPTIMIZATION = 'enable_bf16_optimization'
 
+# Whether to save stablehlo as an external file.
+SAVE_SHLO_TO_FILE = 'save_shlo_to_file'
+
 ################################################################################
 # Proto field names
 ################################################################################

@@ -45,20 +45,32 @@ class MainLibTest(parameterized.TestCase):
           testcase_name='_default',
           native_serialization_platforms=None,
           polymorphic_shape=False,
+          save_shlo_to_file=False,
+      ),
+      dict(
+          testcase_name='_default_save_shlo_to_file',
+          native_serialization_platforms=None,
+          polymorphic_shape=False,
+          save_shlo_to_file=True,
       ),
       dict(
           testcase_name='_native_cpu_serialization',
           native_serialization_platforms=[obm.manifest_pb2.Platform.CPU],
           polymorphic_shape=False,
+          save_shlo_to_file=False,
       ),
       dict(
           testcase_name='_polymorphic_shape',
           native_serialization_platforms=None,
           polymorphic_shape=True,
+          save_shlo_to_file=False,
       ),
   )
   def test_sharded_jax_e2e(
-      self, native_serialization_platforms, polymorphic_shape
+      self,
+      native_serialization_platforms,
+      polymorphic_shape,
+      save_shlo_to_file=False,
   ):
 
     def _jax_model_fn(params, x):
@@ -135,6 +147,7 @@ class MainLibTest(parameterized.TestCase):
         save_dir_path,
         obm.SaveOptions(
             version=2,
+            save_shlo_to_file=save_shlo_to_file,
             supplementals={
                 simple_orchestration.TEST_ORCHESTRATION_SUPPLEMENTAL_NAME: (
                     obm.GlobalSupplemental(
@@ -302,6 +315,29 @@ class MainLibTest(parameterized.TestCase):
         f'{model_function_name}_jax_specific_info_supplemental.pb'
     )
 
+    if save_shlo_to_file:
+      stable_hlo_text = (
+          """
+                stable_hlo {
+                  file_system_location {
+                    string_path: \""""
+          + model_function_name
+          + """.shlo\"
+                  }
+                  mime_type: "application/x.mlir-stablehlo"
+                  version: "1.0"
+                }
+      """
+      )
+    else:
+      stable_hlo_text = """
+                stable_hlo {
+                  inlined_bytes: "ML StableHLO v0.9.0 ..."
+                  mime_type: "application/x.mlir-stablehlo"
+                  version: "1.0"
+                }
+      """
+
     expected_manifest_proto_text = (
         """
       objects {
@@ -314,11 +350,9 @@ class MainLibTest(parameterized.TestCase):
         + """
             body {
               stable_hlo_body {
-                stable_hlo {
-                  inlined_bytes: "ML StableHLO v0.9.0 ..."
-                  mime_type: "application/x.mlir-stablehlo"
-                  version: "1.0"
-                }
+                """
+        + stable_hlo_text
+        + """
                 calling_convention_version: 10
                 lowering_platforms: "cpu"
                 module_kept_var_idx: 0
@@ -388,26 +422,38 @@ class MainLibTest(parameterized.TestCase):
     expected_manifest_proto = text_format.Parse(
         expected_manifest_proto_text, obm.manifest_pb2.Manifest()
     )
+    if save_shlo_to_file:
+      ignored_fields = []
+    else:
+      ignored_fields = [
+          'objects.function.body.stable_hlo_body.stable_hlo.inlined_bytes'
+      ]
     compare.assertProtoEqual(
         self,
         manifest_proto,
         expected_manifest_proto,
-        ignored_fields=[
-            'objects.function.body.stable_hlo_body.stable_hlo.inlined_bytes'
-        ],
+        ignored_fields=ignored_fields,
     )
-    self.assertIn(
-        b'ML\xef',
-        manifest_proto.objects[
-            model_function_name
-        ].function.body.stable_hlo_body.stable_hlo.inlined_bytes,
-    )
-    self.assertIn(
-        b'StableHLO_v',
-        manifest_proto.objects[
-            model_function_name
-        ].function.body.stable_hlo_body.stable_hlo.inlined_bytes,
-    )
+    if save_shlo_to_file:
+      shlo_file_path = os.path.join(save_dir_path, f'{model_function_name}.shlo')
+      self.assertTrue(os.path.exists(shlo_file_path))
+      with open(shlo_file_path, 'rb') as f:
+        shlo_bytes = f.read()
+      self.assertIn(b'ML\xef', shlo_bytes)
+      self.assertIn(b'StableHLO_v', shlo_bytes)
+    else:
+      self.assertIn(
+          b'ML\xef',
+          manifest_proto.objects[
+              model_function_name
+          ].function.body.stable_hlo_body.stable_hlo.inlined_bytes,
+      )
+      self.assertIn(
+          b'StableHLO_v',
+          manifest_proto.objects[
+              model_function_name
+          ].function.body.stable_hlo_body.stable_hlo.inlined_bytes,
+      )
 
     pipeline_proto = simple_orchestration_pb2.Pipeline()
     with open(os.path.join(save_dir_path, supplemental_filename), 'rb') as f:

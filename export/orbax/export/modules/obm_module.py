@@ -204,6 +204,11 @@ class ObmModule(orbax_module_base.OrbaxModuleBase):
         self._apply_fn_keys,
         constants.PERSIST_XLA_FLAGS,
     )
+    self._save_shlo_to_file = _get_shared_value(
+        self._jax2obm_options,
+        self._apply_fn_keys,
+        constants.SAVE_SHLO_TO_FILE,
+    )
 
     self._checkpoint_path: str = None
     # Set the Orbax checkpoint path if provided in the jax2obm_kwargs.
@@ -229,6 +234,9 @@ class ObmModule(orbax_module_base.OrbaxModuleBase):
         persist_xla_flags=jax2obm_kwargs.get(constants.PERSIST_XLA_FLAGS, True),
         enable_bf16_optimization=jax2obm_kwargs.get(
             constants.ENABLE_BF16_OPTIMIZATION, False
+        ),
+        save_shlo_to_file=jax2obm_kwargs.get(
+            constants.SAVE_SHLO_TO_FILE, False
         ),
     )
 
