@@ -1,0 +1,42 @@
+# Sweeps `safetensors_max_over_read_ratio` on Mistral 7B inner-dim TP.
+#
+# Standalone bench (not capture/compare): demonstrates the tradeoff the
+# new `max_over_read_ratio` knob controls on a real strided-shard load.
+# Same model + mesh as `mistral7b_tp_capture.yaml`; only the ratio varies.
+#
+# Per the design doc §10.3, raising the ratio trades per-host over-read
+# for fewer RTTs. On GCS, the win is large (~30 ms RTT per ranged GET).
+# This YAML measures the curve so the right default per backend is
+# data-driven rather than guessed.
+#
+# Run as:
+#   python -m orbax.checkpoint._src.testing.benchmarks.run_benchmarks \
+#     --config_file=checkpoint/.../configs/mistral7b_tp_ratio_sweep.yaml \
+#     --output_directory=gs://orbax-benchmarks/runs/$USER/ratio_sweep/
+#
+# Watch in the dashboard:
+#   * `6_io/file_reads_per_host_count` -- decreases as ratio rises.
+#   * `6_io/file_bytes_read_per_host` -- increases as ratio rises
+#     (bounded at `ratio x ideal`).
+#   * `load_4_throughput/load_total_gbps` -- the headline. The sweet
+#     spot is where RTT savings stop overcoming the over-read cost.
+#
+# Requires the new sharding-driven loader (`max_over_read_ratio` knob
+# is exposed only after the loader change merges).
+
+suite_name: "safetensor_load_mistral7b_tp_ratio_sweep"
+num_repeats: 4
+
+mesh_config:
+  mesh_axes: ["tp"]
+  ici_parallelism: {"tp": 8}
+
+benchmarks:
+  - generator: "orbax.checkpoint._src.testing.benchmarks.safetensor.load_benchmark.SafetensorLoadBenchmark"
+    options:
+      checkpoint_path: "gs://orbax-benchmarks/fixtures/mistral7b/"
+      sharding_config_path: "gs://orbax-benchmarks/sharding/mistral7b_tp8.json"
+      enable_trace: true
+      # The sweep. Each value becomes a separate run in the dashboard;
+      # the parallel-coordinates view colors them so the curve is visible.
+      safetensors_max_over_read_ratio: [2.0, 3.0, 4.0, 6.0]

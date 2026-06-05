@@ -16,10 +16,11 @@
 
 from __future__ import annotations
 
+from collections.abc import Callable
 import contextvars
 import dataclasses
 import enum
-from typing import Any, Callable, Protocol
+from typing import Any, Protocol
 
 from etils import epath
 import numpy as np
@@ -31,7 +32,6 @@ from orbax.checkpoint.experimental.v1._src.handlers import registration
 from orbax.checkpoint.experimental.v1._src.path import types as path_types
 from orbax.checkpoint.experimental.v1._src.serialization import types as serialization_types
 from orbax.checkpoint.experimental.v1._src.tree import types as tree_types
-
 
 FROZEN_IDS: contextvars.ContextVar[frozenset[int]] = contextvars.ContextVar(
     'orbax_frozen_option_ids', default=frozenset()
@@ -115,7 +115,9 @@ class AsyncOptions(_ActiveContextGuard):
     return v0_options_lib.AsyncOptions(
         timeout_secs=self.timeout_secs,
         post_finalization_callback=self.post_finalization_callback,
-        create_directories_asynchronously=self.create_directories_asynchronously,
+        create_directories_asynchronously=(
+            self.create_directories_asynchronously
+        ),
     )
 
 
@@ -484,8 +486,10 @@ class CheckpointablesOptions(_ActiveContextGuard):
   """
 
   registry: registration.CheckpointableHandlerRegistry = dataclasses.field(
-      default_factory=lambda: registration.ReadOnlyCheckpointableHandlerRegistry(
-          registration.local_registry(include_global_registry=True)
+      default_factory=lambda: (
+          registration.ReadOnlyCheckpointableHandlerRegistry(
+              registration.local_registry(include_global_registry=True)
+          )
       )
   )
 
@@ -533,11 +537,9 @@ class DeletionOptions(_ActiveContextGuard):
 
     todelete_full_path: str | None = None
 
-
   gcs_deletion_options: GcsDeletionOptions = dataclasses.field(
       default_factory=GcsDeletionOptions
   )
-
 
 
 @dataclasses.dataclass(kw_only=True)
@@ -592,13 +594,20 @@ class MemoryOptions(_ActiveContextGuard):
 class SafetensorsOptions(_ActiveContextGuard):
   """Options for configuring Safetensors loading.
 
+  In-flight read bytes are bounded by `MemoryOptions.read_concurrent_bytes`,
+  shared with the rest of restore (the loader falls back to a 2 GiB default
+  when it is unset, since its streaming path needs a finite budget).
+
   Attributes:
-    ignore_load_sharding: If True, skips sharding of the tensors across
-      hosts/devices during load. Whole tensors will be present on each host,
-      allowing for efficient conversion.
+    max_over_read_ratio: Maximum tolerated `block_size / needed_bytes` when
+      coalescing per-host byte runs from one file into a single read. A higher
+      value collapses more requests at the cost of more over-read; a value of
+      1.0 disables any over-read. Worst-case per-host bytes from one file are
+      bounded at `max_over_read_ratio * ideal_bytes`. `None` selects an
+      implementation default (currently `2.0`).
   """
 
-  ignore_load_sharding: bool = False
+  max_over_read_ratio: float | None = None
 
 
 class CheckpointLayout(enum.Enum):

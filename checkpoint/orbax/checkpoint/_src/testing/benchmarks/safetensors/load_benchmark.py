@@ -50,8 +50,9 @@ class SafetensorLoadBenchmarkOptions(benchmarks_core.BenchmarkOptions):
 
   Self-contained: builds its own `ocp.Context()` with the SAFETENSORS layout
   pinned from the load-side tuning knobs, so a single run can sweep e.g.
-  `use_load_and_broadcast` or `restore_concurrent_gb` for A/B comparison. Each
-  knob may be a single value or a list to expand into a parameter sweep.
+  `use_load_and_broadcast`, `restore_concurrent_gb`, or
+  `safetensors_max_over_read_ratio` for A/B comparison. Each knob may be a
+  single value or a list to expand into a parameter sweep.
 
   Attributes:
     checkpoint_path: Path (local or `gs://`) to a directory containing one or
@@ -74,6 +75,12 @@ class SafetensorLoadBenchmarkOptions(benchmarks_core.BenchmarkOptions):
       others instead of every replica reading from storage.
     restore_concurrent_gb: Cap on concurrent read bytes (in GiB); `None` leaves
       the Orbax default.
+    safetensors_max_over_read_ratio: Override for
+      `SafetensorsOptions.max_over_read_ratio`. Bounds per-host cluster egress
+      on strided shardings (inner-dim TP, HSDP). Sweep as `[2.0, 3.0, 4.0]` on a
+      TP variant to measure the read-count vs over-read tradeoff. `None`
+      (default) uses the loader's default (currently 2.0). In-flight read bytes
+      are bounded by `restore_concurrent_gb` (shared with the rest of restore).
     metric_tracemalloc_enabled: Whether to capture the tracemalloc metric
       (opt-in because its per-allocation snapshots are expensive).
   """
@@ -84,6 +91,7 @@ class SafetensorLoadBenchmarkOptions(benchmarks_core.BenchmarkOptions):
   reference_digests_path: str | None = None
   use_load_and_broadcast: bool | list[bool] = False
   restore_concurrent_gb: int | None | list[int | None] = None
+  safetensors_max_over_read_ratio: float | None | list[float | None] = None
   metric_tracemalloc_enabled: bool = False
 
   def is_valid(self) -> bool:
@@ -94,7 +102,10 @@ class SafetensorLoadBenchmarkOptions(benchmarks_core.BenchmarkOptions):
   @property
   def context(self) -> ocp.Context:
     ctx = ocp.Context(
-        checkpoint_layout=ocp.options.CheckpointLayout.SAFETENSORS
+        checkpoint_layout=ocp.options.CheckpointLayout.SAFETENSORS,
+        safetensors_options=ocp.options.SafetensorsOptions(
+            max_over_read_ratio=self.safetensors_max_over_read_ratio,
+        ),
     )
     # TODO(b/519204863): Fix type hint for args like list[T] | T
     ctx.array.loading.use_load_and_broadcast = self.use_load_and_broadcast
