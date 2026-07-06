@@ -15,6 +15,7 @@
 """Defines exported symbols for Orbax Export."""
 
 # pylint: disable=g-importing-member
+from orbax.export import bundle
 from orbax.export import config
 from orbax.export import constants
 from orbax.export import obm_configs
@@ -36,7 +37,6 @@ from orbax.export.serving_config import ServingConfig
 # utils.remove_signature_defaults.
 from orbax.export.utils import remove_signature_defaults
 from orbax.export.utils import TensorSpecWithDefault
-
 
 # A new PyPI release will be pushed everytime `__version__` is increased.
 __version__ = '0.0.8'
