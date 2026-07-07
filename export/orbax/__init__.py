@@ -14,8 +14,9 @@
 
 """Defines exported symbols for Orbax Export."""
 
+
+# TODO(hjswe): strip all orbax model export code.
 # pylint: disable=g-importing-member
-from orbax.export import bundle
 from orbax.export import config
 from orbax.export import constants
 from orbax.export import obm_configs
