@@ -24,7 +24,7 @@ JAX_PROCESS_ID and JAX_NUM_PROCESSES.
 
 try:  # SimDevice import must occur before JAX.
   import simdevice  # pylint: disable=unused-import
-except ImportError:
+except (ImportError, FileNotFoundError):
   pass
 
 import os
