@@ -99,7 +99,7 @@ def save(
   :py:func:`.finalize` is called. The intermediate checkpoints are
   temporary and should not be used directly.
 
-  ### Workflow
+  Workflow:
 
   A typical partial save workflow involves one or more calls to
   :py:func:`.save` followed by a single call to :py:func:`~.finalize`::
@@ -121,16 +121,17 @@ def save(
     # '/path/to/my/checkpoint'.
     ocp.partial.finalize(path)
 
-  ### Additions vs. Replacements
+  Additions vs. Replacements:
 
-  The provided `state` represents a set of updates.
-  - If a key in `state` (e.g., 'metrics') does not exist in the on-disk
-    checkpoint, it is treated as an **addition**. In other words, the sets of
-    keys of the on-disk PyTree and the provided `state` are disjoint.
-  - If a key (e.g., 'step') already exists, its value is **replaced**. In other
-    words, the sets of keys of the on-disk PyTree and the provided `state`
-    overlap. Replacements are currently NOT supported. Please reach out to the
-    Orbax team if you need this functionality.
+    The provided `state` represents a set of updates.
+
+    - If a key in `state` (e.g., 'metrics') does not exist in the on-disk
+      checkpoint, it is treated as an **addition**. In other words, the sets of
+      keys of the on-disk PyTree and the provided `state` are disjoint.
+    - If a key (e.g., 'step') already exists, its value is **replaced**. In
+      other words, the sets of keys of the on-disk PyTree and the provided
+      `state` overlap. Replacements are currently NOT supported. Please reach
+      out to the Orbax team if you need this functionality.
 
   See :py:func:`~.v1.save` for general
   PyTree saving documentation.
@@ -177,7 +178,7 @@ def save_async(
   :py:func:`.finalize` is called. The intermediate checkpoints are
   temporary and may be garbage collected in certain environments.
 
-  ### Workflow
+  Workflow:
 
   A typical partial save workflow involves one or more calls to
   :py:func:`.save_async` followed by a single call to
@@ -202,14 +203,15 @@ def save_async(
     # '/path/to/my/checkpoint'.
     ocp.partial.finalize(path)
 
-  ### Additions vs. Replacements
+  Additions vs. Replacements:
 
-  The provided `state` represents a set of updates.
-  - If a key in `state` (e.g., 'metrics') does not exist in the on-disk
-    checkpoint, it is treated as an **addition**.
-  - If a key (e.g., 'step') already exists, its value is **replaced**.
-    Replacements are currently NOT supported. Please reach out to the Orbax team
-    if you need this functionality.
+    The provided `state` represents a set of updates.
+
+    - If a key in `state` (e.g., 'metrics') does not exist in the on-disk
+      checkpoint, it is treated as an **addition**.
+    - If a key (e.g., 'step') already exists, its value is **replaced**.
+      Replacements are currently NOT supported. Please reach out to the Orbax
+      team if you need this functionality.
 
   See :py:func:`~.v1.save_async` for general
   PyTree saving documentation.
@@ -527,7 +529,8 @@ def finalize(path: path_types.PathLike) -> None:
   This function is what makes those changes permanent.
 
 
-  ### Example::
+  Example::
+
     path = '/path/to/my/checkpoint'
 
     # These calls write to a temporary, versioned directory, not the final path.
