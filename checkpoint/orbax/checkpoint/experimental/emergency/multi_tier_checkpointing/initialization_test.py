@@ -414,6 +414,7 @@ class MultiTierCheckpointingInitializationTest(
         data_parallelism=1,
         use_colocated_python=True,
         backup_interval_minutes=15,
+        devices=None,
     )
 
     # Verify colocated Python path is taken
@@ -424,10 +425,58 @@ class MultiTierCheckpointingInitializationTest(
         run_name="test-colocated-run",
         data_parallelism=1,
         timeout_seconds=900,
+        devices=None,
     )
 
     # Verify standard multi-controller JAX init is bypassed
     mock_jax_distributed_initialize.assert_not_called()
+
+  @mock.patch.object(initialization, "_initialize_mtc_colocated", autospec=True)
+  @mock.patch.object(jax.distributed, "initialize", autospec=True)
+  def test_initialize_multi_tier_checkpointing_colocated_uses_devices(
+      self,
+      mock_jax_distributed_initialize,
+      mock_init_mtc_colocated,
+  ):
+    tmp_dir_path = epath.Path(self.create_tempdir().full_path)
+    active_devices = (
+        mock.Mock(spec=jax.Device),
+        mock.Mock(spec=jax.Device),
+    )
+
+    initialization.initialize_multi_tier_checkpointing(
+        tmp_dir_path,
+        num_slices=1,
+        run_name="test-colocated-run",
+        data_parallelism=1,
+        use_colocated_python=True,
+        devices=active_devices,
+    )
+
+    mock_init_mtc_colocated.assert_called_once_with(
+        local_checkpoint_directory=tmp_dir_path,
+        backup_interval_minutes=30,
+        num_slices=1,
+        run_name="test-colocated-run",
+        data_parallelism=1,
+        timeout_seconds=900,
+        devices=active_devices,
+    )
+    mock_jax_distributed_initialize.assert_not_called()
+
+  def test_initialize_multi_tier_checkpointing_rejects_devices_without_colocated_python(
+      self,
+  ):
+    tmp_dir_path = epath.Path(self.create_tempdir().full_path)
+
+    with self.assertRaisesRegex(
+        ValueError, "`devices` is only supported when use_colocated_python=True"
+    ):
+      initialization.initialize_multi_tier_checkpointing(
+          tmp_dir_path,
+          run_name="test-run",
+          devices=(mock.Mock(spec=jax.Device),),
+      )
 
   @mock.patch.object(initialization.jax, "make_array_from_callback")
   @mock.patch.object(initialization.jax, "block_until_ready")
@@ -495,7 +544,11 @@ class MultiTierCheckpointingInitializationTest(
     )
     mock_topology_from_devices.return_value = topology
     mock_get_dummy_input_array.return_value = dummy_in
-    mock_devices.return_value = ["tpu0"]
+    active_devices = (
+        mock.Mock(spec=jax.Device),
+        mock.Mock(spec=jax.Device),
+    )
+    mock_devices.return_value = ("stale_tpu0", "stale_tpu1")
     mock_make_array_from_callback.return_value = np.asarray(True)
     mock_time.side_effect = [90.0, 100.0, 100.0, 110.0, 120.0]
 
@@ -529,10 +582,12 @@ class MultiTierCheckpointingInitializationTest(
           run_name="test-run",
           data_parallelism=1,
           timeout_seconds=900,
+          devices=active_devices,
       )
 
     mock_install_patch.assert_called_once_with()
-    mock_topology_from_devices.assert_called_once_with(("tpu0",))
+    mock_devices.assert_not_called()
+    mock_topology_from_devices.assert_called_once_with(active_devices)
     topology.worker_cpu_devices.assert_called_once_with()
     topology.worker_rank_array.assert_called_once_with(
         topology.worker_cpu_devices.return_value

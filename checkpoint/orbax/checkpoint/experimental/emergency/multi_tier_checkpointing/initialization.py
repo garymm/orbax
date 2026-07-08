@@ -17,7 +17,7 @@
 import os
 import re
 import time
-from typing import List, Optional
+from typing import List, Optional, Sequence
 
 from absl import logging
 from etils import epath
@@ -155,6 +155,7 @@ def _initialize_mtc_colocated(
     run_name: str,
     data_parallelism: int,
     timeout_seconds: int,
+    devices: Optional[Sequence[jax.Device]] = None,
 ) -> None:
   """Initializes multi-tier checkpointing with a colocated Python sidecar on all workers.
 
@@ -166,15 +167,17 @@ def _initialize_mtc_colocated(
     run_name: The run name.
     data_parallelism: The data parallelism.
     timeout_seconds: The timeout in seconds.
+    devices: Optional JAX devices to initialize on. If unset, all devices
+      visible to the controller are used.
   """
   logging.info(
       'Initializing colocated MTC setup: '
       f'process_count={jax.process_count()}, device_count={jax.device_count()}'
   )
   colocated_transport.install_pathways_colocated_serialization_patch()
-  all_devices = jax.devices()
+  all_devices = tuple(devices) if devices is not None else tuple(jax.devices())
 
-  topology = pathways_topology.Topology.from_devices(tuple(all_devices))
+  topology = pathways_topology.Topology.from_devices(all_devices)
   worker_cpu_devices = topology.worker_cpu_devices()
   worker_rank_in = topology.worker_rank_array(worker_cpu_devices)
   num_nodes = topology.num_workers
@@ -333,6 +336,7 @@ def initialize_multi_tier_checkpointing(
     jax_initialization_timeout_seconds: int = 900,
     use_mtc_process_ids: bool = True,
     use_colocated_python: bool = False,
+    devices: Optional[Sequence[jax.Device]] = None,
 ):
   """Initializes multi-tier checkpointing.
 
@@ -348,6 +352,9 @@ def initialize_multi_tier_checkpointing(
     jax_initialization_timeout_seconds: The timeout for JAX initialization.
     use_mtc_process_ids: Use the MTC rank server to calculate process ids.
     use_colocated_python: Whether to use Colocated Python for initialization.
+    devices: Optional JAX devices for Colocated Python initialization. This is
+      useful when the caller has already filtered controller-visible devices,
+      such as after an elastic restart.
   """
   run_name = run_name if run_name else os.environ.get('JOBSET_NAME')
   if not run_name:
@@ -370,8 +377,14 @@ def initialize_multi_tier_checkpointing(
         run_name=run_name,
         data_parallelism=data_parallelism,
         timeout_seconds=jax_initialization_timeout_seconds,
+        devices=devices,
     )
     return
+
+  if devices is not None:
+    raise ValueError(
+        '`devices` is only supported when use_colocated_python=True.'
+    )
 
   # Standard Multi-Controller Path
   if use_mtc_process_ids:
