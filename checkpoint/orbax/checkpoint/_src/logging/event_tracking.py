@@ -90,7 +90,7 @@ class OperationRecorder:
             else '/jax/orbax/write/start'
         )
         record_start_time_name = (
-            '/jax/checkpoint/write/async/start_time'
+            '/jax/orbax/write/async/start_time'
             if self._async_origin
             else '/jax/orbax/write/start_time'
         )
@@ -139,7 +139,7 @@ class OperationRecorder:
                 storage_type=self._storage_type,
             )
             jax.monitoring.record_scalar(
-                '/jax/checkpoint/write/async/blocking_end_time',
+                '/jax/orbax/write/async/blocking_end_time',
                 _seconds_to_milliseconds(end_time),
                 storage_type=self._storage_type,
             )
