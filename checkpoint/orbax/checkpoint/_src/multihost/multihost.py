@@ -15,6 +15,7 @@
 """Orbax utils related to multihost_utils functionality."""
 
 import functools
+import os
 import threading
 import time
 from typing import List, Optional, Protocol, Set
@@ -63,6 +64,30 @@ def coordination_timeout() -> int:
 
 def is_proxy_pathways_backend() -> bool:
   return jax.devices()[0].client.runtime_type == 'proxy/pathways'
+
+
+def is_cloud_pathways_persistence_enabled() -> bool:
+  """Returns whether Cloud Pathways persistence is enabled.
+
+  This function checks the environment variable ENABLE_PATHWAYS_PERSISTENCE to
+  determine whether persistence is enabled. If the variable is set to "1",
+  persistence is enabled. If the variable is set to "0" or unset, persistence is
+  disabled.
+
+  Returns:
+    True if persistence is enabled, False otherwise.
+  """
+  if 'ENABLE_PATHWAYS_PERSISTENCE' in os.environ:
+    if os.environ['ENABLE_PATHWAYS_PERSISTENCE'] == '1':
+      return True
+    if os.environ['ENABLE_PATHWAYS_PERSISTENCE'] == '0':
+      return False
+    else:
+      raise ValueError(
+          'ENABLE_PATHWAYS_PERSISTENCE must be set to 1/0 or unset, got: '
+          + os.environ['ENABLE_PATHWAYS_PERSISTENCE']
+      )
+  return False
 
 
 def is_native_pathways_backend() -> bool:

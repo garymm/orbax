@@ -38,10 +38,16 @@ CheckpointingImpl = pathways_types.CheckpointingImpl
 
 def _get_pathways_persistence_array_handler(
     **kwargs,
-) -> type_handlers.ArrayHandler:
-  """Returns the Pathways persistence array handler."""
+) -> type_handlers.ArrayHandler | None:
+  """Returns the Pathways persistence array handler, or None if disabled."""
+  # For proxy Pathways, only use persistence if the environment variable is set
+  # to enable it. Otherwise, return None to fallback to not using a dispatcher.
   if multihost.is_proxy_pathways_backend():
-    logging.info('Using CloudPathwaysArrayHandler for jax.Array.')
+    if not multihost.is_cloud_pathways_persistence_enabled():
+      return None
+    logging.info(
+        'Using persistence mode with CloudPathwaysArrayHandler for jax.Array.'
+    )
     return cloud_pathways_array_handler.CloudPathwaysArrayHandler(**kwargs)
 
   raise NotImplementedError(
@@ -111,18 +117,21 @@ def get_pathways_array_handler(
       use_colocated_python=True,
       use_persistence_array_handler=True,
   )
+  dispatcher = None
   match checkpointing_impl:
     case CheckpointingImpl.COLOCATED_PYTHON:
       logging.info('Using ColocatedPythonDispatcher')
       dispatcher = dispatchers.ColocatedPythonDispatcher()
     case CheckpointingImpl.PERSISTENCE:
-      logging.info('Using persistence array handler for jax.Array.')
-      return _get_pathways_persistence_array_handler(**kwargs)
+      if handler := _get_pathways_persistence_array_handler(**kwargs):
+        return handler
     case CheckpointingImpl.NO_DISPATCHER:
-      logging.info('Not using dispatcher')
-      dispatcher = None
+      pass
     case _:
       raise ValueError(f'Unsupported CheckpointingImpl: {checkpointing_impl}')
+
+  if dispatcher is None:
+    logging.info('Not using dispatcher')
 
   return _get_array_hander_with_dispatcher(
       dispatcher,

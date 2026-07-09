@@ -54,7 +54,9 @@ def resolve_pathways_checkpointing_impl(
 
   return pathways_types.CheckpointingImpl.from_options(
       use_colocated_python=False,  # Not enabled unless explicitly requested.
-      use_persistence_array_handler=True,  # Only used as a fallback.
+      # Attempt to use as a fallback, otherwise fallback to no dispatcher if
+      # using proxy Pathways without persistence enabled.
+      use_persistence_array_handler=True,
   )
 
 
