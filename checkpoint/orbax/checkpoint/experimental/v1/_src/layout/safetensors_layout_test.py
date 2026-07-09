@@ -523,9 +523,9 @@ class PartitionRunsTest(parameterized.TestCase):
     self.assertEqual(blocks[0].members, (0, 1))
 
   def test_large_dense_block_is_not_capped_by_partition(self):
-    # Block size is intentionally unbounded in partition; the scheduler's
-    # byte budget handles oversized blocks by streaming. A single 1 GiB run
-    # is one block of 1 GiB regardless of any "size cap" -- there isn't one.
+    # Block size is intentionally unbounded in partition; oversized blocks
+    # are split at the read chunk size later. A single 1 GiB run is one
+    # block of 1 GiB regardless of any "size cap" -- there isn't one.
     blocks = safetensors_layout._partition_runs(
         [(0, 1 << 30)], max_over_read_ratio=1.0
     )
@@ -590,13 +590,12 @@ class PartitionRunsTest(parameterized.TestCase):
       safetensors_layout._partition_runs([(0, 100)], max_over_read_ratio=0.5)
 
 
-class PerFileSchedulerTest(
-    unittest.IsolatedAsyncioTestCase, parameterized.TestCase
-):
-  """End-to-end correctness of the per-file scheduler.
+class FileReadTest(unittest.IsolatedAsyncioTestCase, parameterized.TestCase):
+  """End-to-end correctness of `_plan_chunk_reads` + `_read_file`.
 
   The partition policy is exercised separately in `PartitionRunsTest`; here we
-  verify the scheduler delivers the right bytes to each registered callback.
+  verify the planned chunk reads deliver the right bytes to each destination
+  buffer, under both single-chunk and split-block paths.
   """
 
   def setUp(self):
@@ -606,30 +605,23 @@ class PerFileSchedulerTest(
     self.payload = bytes(range(256)) * 16  # 4 KB of varied bytes
     self.file_path.write_bytes(self.payload)
 
-  async def _run(self, ratio, budget_bytes, offsets, lengths):
-    """Registers `(offset, length)` pairs; returns the bytes each received.
-
-    Concatenates successive chunk deliveries per registration to verify
-    correctness under both single-read and streamed-chunk paths.
-    """
+  async def _run(self, ratio, chunk_bytes, offsets, lengths):
+    """Reads `(offset, length)` runs; returns the bytes each received."""
     # +1 mirrors `_load`: LimitInFlightBytes reserves strictly fewer than its
-    # max, so the largest reservable chunk is `budget_bytes`.
-    budget = limits.LimitInFlightBytes(budget_bytes + 1)
-    sched = safetensors_layout._PerFileScheduler(
-        self.file_path, budget, max_over_read_ratio=ratio
+    # max, so the largest reservable chunk is `chunk_bytes`.
+    budget = limits.LimitInFlightBytes(chunk_bytes + 1)
+    reads = [
+        safetensors_layout._Read(o, l, np.zeros(l, dtype=np.uint8))
+        for o, l in zip(offsets, lengths)
+    ]
+    await safetensors_layout._read_file(
+        self.file_path,
+        reads,
+        budget,
+        max_over_read_ratio=ratio,
+        chunk_bytes=chunk_bytes,
     )
-    received: list[bytearray] = [bytearray() for _ in offsets]
-
-    def make_cb(idx):
-      def cb(chunk):
-        received[idx].extend(bytes(chunk))
-
-      return cb
-
-    for i, (o, l) in enumerate(zip(offsets, lengths)):
-      sched.register(o, l, make_cb(i))
-    await sched.execute()
-    return [bytes(b) for b in received]
+    return [r.dst.tobytes() for r in reads]
 
   async def test_delivers_bytes_for_dense_runs(self):
     offsets, lengths = [0, 16, 32, 48], [16, 16, 16, 16]
@@ -643,69 +635,83 @@ class PerFileSchedulerTest(
     for off, b in zip(offsets, received):
       self.assertEqual(b, self.payload[off : off + 16])
 
-  async def test_delivers_bytes_when_budget_streams_block(self):
-    # 5 dense 16-byte runs coalesce into one 80-byte block (ratio 1.0).
-    # Budget 64 forces the scheduler to stream the block in two chunks
-    # (64 + 16). Each callback may be invoked twice; concatenated bytes
-    # must equal the source slice.
+  async def test_delivers_bytes_when_block_splits_into_chunks(self):
+    # 5 dense 16-byte runs coalesce into one 80-byte block (ratio 1.0). A
+    # 64-byte chunk size splits the block into two reads (64 + 16); the run
+    # straddling the boundary is served by both.
     offsets = [0, 16, 32, 48, 64]
     received = await self._run(1.0, 64, offsets, [16] * 5)
     for off, b in zip(offsets, received):
       self.assertEqual(b, self.payload[off : off + 16])
 
-  async def test_delivers_bytes_when_budget_smaller_than_single_run(self):
-    # One 64-byte run with a 16-byte budget -> 4 chunks of 16 each. The
-    # callback is invoked 4 times in offset order.
+  async def test_delivers_bytes_when_chunk_smaller_than_single_run(self):
+    # One 64-byte run with a 16-byte chunk size -> 4 reads, each serving a
+    # quarter of the run.
     received = await self._run(1.0, 16, [0], [64])
     self.assertEqual(received[0], self.payload[:64])
 
-  async def test_execute_returns_read_stats(self):
+  async def test_read_file_returns_read_stats(self):
     # 4 dense 16-byte runs coalesce into one 64-byte block (ratio 1.0); the
-    # huge budget reads it in a single ranged GET.
+    # huge chunk size reads it in a single ranged GET.
     budget = limits.LimitInFlightBytes((1 << 20) + 1)
-    sched = safetensors_layout._PerFileScheduler(
-        self.file_path, budget, max_over_read_ratio=1.0
+    reads = [
+        safetensors_layout._Read(o, 16, np.zeros(16, dtype=np.uint8))
+        for o in (0, 16, 32, 48)
+    ]
+    stats = await safetensors_layout._read_file(
+        self.file_path,
+        reads,
+        budget,
+        max_over_read_ratio=1.0,
+        chunk_bytes=1 << 20,
     )
-    for o in (0, 16, 32, 48):
-      sched.register(o, 16, lambda chunk: None)
-    stats = await sched.execute()
     self.assertEqual(stats.needed_bytes, 64)
     self.assertEqual(stats.read_bytes, 64)
     self.assertEqual(stats.num_reads, 1)
-    self.assertEqual(stats.num_gets, 1)  # fits the budget -> single GET.
+    self.assertEqual(stats.num_gets, 1)  # fits one chunk -> single GET.
 
-  async def test_execute_stats_count_block_and_stream_chunks(self):
-    # One 64-byte run with a 16-byte budget streams in 4 chunks. It is still a
-    # single coalesced block (num_reads == 1), but four actual GETs are issued
-    # (num_gets == 4).
+  async def test_stats_count_block_and_split_chunks(self):
+    # One 64-byte run with a 16-byte chunk size splits into 4 reads. It is
+    # still a single coalesced block (num_reads == 1), but four actual GETs
+    # are issued (num_gets == 4).
     budget = limits.LimitInFlightBytes(16 + 1)
-    sched = safetensors_layout._PerFileScheduler(
-        self.file_path, budget, max_over_read_ratio=1.0
+    reads = [safetensors_layout._Read(0, 64, np.zeros(64, dtype=np.uint8))]
+    stats = await safetensors_layout._read_file(
+        self.file_path,
+        reads,
+        budget,
+        max_over_read_ratio=1.0,
+        chunk_bytes=16,
     )
-    sched.register(0, 64, lambda chunk: None)
-    stats = await sched.execute()
     self.assertEqual(stats.read_bytes, 64)
     self.assertEqual(stats.num_reads, 1)
     self.assertEqual(stats.num_gets, 4)
 
-  async def test_execute_with_no_registrations_is_noop(self):
+  async def test_read_file_with_no_reads_is_noop(self):
     budget = limits.LimitInFlightBytes(1 << 20)
-    sched = safetensors_layout._PerFileScheduler(
-        self.file_path, budget, max_over_read_ratio=2.0
-    )
-    await sched.execute()  # must not raise, must not open the file.
+    stats = await safetensors_layout._read_file(
+        self.file_path,
+        [],
+        budget,
+        max_over_read_ratio=2.0,
+        chunk_bytes=1 << 20,
+    )  # must not raise, must not open the file.
+    self.assertEqual(stats.num_gets, 0)
 
   async def test_read_failure_raises(self):
     budget = limits.LimitInFlightBytes(1 << 20)
-    sched = safetensors_layout._PerFileScheduler(
-        epath.Path('/nonexistent/path.bin'),
-        budget,
-        max_over_read_ratio=2.0,
-    )
-    sched.register(0, 16, lambda chunk: None)
-    sched.register(16, 16, lambda chunk: None)
+    reads = [
+        safetensors_layout._Read(o, 16, np.zeros(16, dtype=np.uint8))
+        for o in (0, 16)
+    ]
     with self.assertRaises(Exception):
-      await sched.execute()
+      await safetensors_layout._read_file(
+          epath.Path('/nonexistent/path.bin'),
+          reads,
+          budget,
+          max_over_read_ratio=2.0,
+          chunk_bytes=1 << 20,
+      )
 
 
 class RecordReadStatsTest(absltest.TestCase):
@@ -831,9 +837,9 @@ class SafetensorsLayoutEdgeCaseTest(
   async def test_options_override_partition_defaults(self):
     np_save_file({'a': np.arange(8, dtype=np.float32)}, self.file_path)
     layout = SafetensorsLayout()
-    # ratio 1.0 forces per-tensor block isolation; a tiny budget forces the
-    # scheduler to stream each block in multiple chunks. Correctness must
-    # hold under both -- callbacks must reassemble bytes across calls.
+    # ratio 1.0 forces per-tensor block isolation; a tiny budget forces each
+    # block to split into multiple chunk reads. Correctness must hold under
+    # both -- the chunks must reassemble into the full tensor bytes.
     with context_lib.Context(
         memory_options=options_lib.MemoryOptions(read_concurrent_bytes=16),
         safetensors_options=options_lib.SafetensorsOptions(
@@ -862,18 +868,18 @@ class SingleHostOneReadInvariantTest(
 
   async def _count_reads_during_load(self, abstract_state=None):
     read_count = 0
-    original = safetensors_layout._PerFileScheduler._read_block
+    original = safetensors_layout._read_chunk
 
-    async def counting_read_block(self, block):
+    async def counting_read_chunk(path, chunk, byte_budget):
       nonlocal read_count
       read_count += 1
-      return await original(self, block)
+      return await original(path, chunk, byte_budget)
 
     layout = SafetensorsLayout()
     with mock.patch.object(
-        safetensors_layout._PerFileScheduler,
-        '_read_block',
-        new=counting_read_block,
+        safetensors_layout,
+        '_read_chunk',
+        new=counting_read_chunk,
     ):
       restore_fn = await layout.load(
           self.file_path, abstract_state=abstract_state

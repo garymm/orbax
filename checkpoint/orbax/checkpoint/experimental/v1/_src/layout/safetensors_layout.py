@@ -23,18 +23,19 @@ reads. This mirrors how the v0 array deserializer
 `jax.sharding.Sharding.devices_indices_map`, with hand-computed byte ranges
 standing in for TensorStore's chunk index.
 
-Byte runs from every tensor a process needs in one file are coalesced together
-by a per-file scheduler under a single bounded-over-read policy: a
-`max_over_read_ratio` cap on `block_size / needed_bytes` keeps cross-host
-egress from blowing up to N x file_size on inner-dim sharding. The scheduler
-then issues each coalesced block as one ranged read -- or streams it in
-budget-sized chunks when the block exceeds the in-flight byte budget
-(`MemoryOptions.read_concurrent_bytes`, the shared restore memory cap). Peak
-host memory beyond the destination shard buffers is bounded at that budget
-regardless of block, shard, or file size.
-The single-host degenerate case -- one process owns every byte of a file --
-collapses to one read per file when the file fits the budget, and a small
-number of back-to-back reads otherwise.
+Byte runs from every tensor a process needs in one file are coalesced under a
+single bounded-over-read policy: a `max_over_read_ratio` cap on
+`block_size / needed_bytes` keeps cross-host egress from blowing up to
+N x file_size on inner-dim sharding. Each coalesced block is then split at a
+fixed chunk size and the chunks are read concurrently, with total in-flight
+bytes bounded by the shared restore budget
+(`MemoryOptions.read_concurrent_bytes`). Peak host memory beyond the
+destination shard buffers is bounded at that budget regardless of block,
+shard, or file size, while a block larger than one chunk -- the single-host
+whole-file case especially -- is fetched as parallel ranged reads instead of
+one long single-stream read. As each file's reads complete, its tensors are
+assembled into `jax.Array`s and their host buffers released while other files
+are still reading.
 """
 
 import asyncio
@@ -86,12 +87,18 @@ _DEFAULT_MAX_OVER_READ_RATIO = 2.0
 # read-count-vs-egress tradeoff is genuinely backend-dependent.
 _DEFAULT_MIN_COALESCE_GAP = 4096  # one page
 # `_DEFAULT_MAX_IN_FLIGHT_BYTES` caps total bytes the loader holds in flight
-# across all concurrent reads in one load call. A single coalesced block
-# larger than this budget is streamed in budget-sized chunks; smaller blocks
-# run concurrently up to the budget. Peak host memory beyond destination
-# shard buffers is bounded at `max_in_flight_bytes` regardless of block,
-# shard, or file size.
+# across all concurrent reads in one load call. Chunks run concurrently up to
+# the budget, so peak host memory beyond destination shard buffers is bounded
+# at `max_in_flight_bytes` regardless of block, shard, or file size.
 _DEFAULT_MAX_IN_FLIGHT_BYTES = 2 * 1024 * 1024 * 1024  # 2 GiB
+# Coalesced blocks are split at this size and the pieces are read
+# concurrently (subject to the in-flight budget). One ranged read runs at
+# single-stream throughput -- on object storage a small fraction of what
+# concurrent range reads achieve -- so a large block is fetched as parallel
+# chunks rather than one long read. 128 MiB keeps per-request overhead
+# negligible while the default 2 GiB budget still admits 16 concurrent
+# streams.
+_DEFAULT_READ_CHUNK_BYTES = 128 * 1024 * 1024  # 128 MiB
 
 # When the over-read cap fragments a load into many small reads -- the strided
 # inner-dim regime -- hint the user toward `max_over_read_ratio`. The warning
@@ -149,6 +156,27 @@ async def _discover_files(path: Path) -> list[Path]:
   if await async_path.is_dir(path):
     return sorted(await async_path.glob(path, f"*{SAFETENSORS_SUFFIX}"))
   return [path]
+
+
+async def _read_all_headers(
+    path: Path,
+) -> list[tuple[Path, dict[str, Any], int]]:
+  """Reads every file's header concurrently.
+
+  A sharded HuggingFace checkpoint can span hundreds of files; reading their
+  headers one after another costs one storage round trip each, so they are
+  fetched in parallel.
+
+  Args:
+    path: A `.safetensors` file, or a directory containing such files.
+
+  Returns:
+    One `(file_path, header, data_start)` tuple per file, in sorted file
+    order.
+  """
+  files = await _discover_files(path)
+  headers = await asyncio.gather(*[_read_header(f) for f in files])
+  return [(f, h, ds) for f, (h, ds) in zip(files, headers)]
 
 
 async def _check_file_length(
@@ -276,10 +304,10 @@ def _partition_runs(
 ) -> list[_CoalescedBlock]:
   """Greedily partitions `(offset, length)` runs into coalesced read blocks.
 
-  Each emitted block is read with one ranged read (or streamed in budget-sized
-  chunks by `_PerFileScheduler` when oversized) and demultiplexed back to its
-  member runs. The partitioner absorbs the next run into the current block when
-  *either* of two conditions holds:
+  Each emitted block is split at the read chunk size into one or more ranged
+  reads and demultiplexed back to its member runs (`_plan_chunk_reads`). The
+  partitioner absorbs the next run into the current block when *either* of two
+  conditions holds:
 
   - `block_size / needed_bytes <= max_over_read_ratio` -- bounding per-host
     egress amplification. With `max_over_read_ratio == 2.0`, a host pulls at
@@ -291,8 +319,8 @@ def _partition_runs(
     gap is always cheaper than a second request.
 
   Block size is intentionally unbounded here. Peak in-flight memory is bounded
-  separately by the scheduler's byte budget (`max_in_flight_bytes`), which
-  also enforces correctness for any block too large to read in one go. This
+  separately by the shared byte budget (`max_in_flight_bytes`), which also
+  enforces correctness for any block too large to read in one go. This
   separation makes the partition policy purely about over-read and the
   budget purely about memory -- each knob expressing one concern.
 
@@ -365,146 +393,149 @@ class _FileEntry(NamedTuple):
   data_start: int  # Byte offset of the file's data section.
 
 
-_RunCallback = Callable[[memoryview], None]
+class _Read(NamedTuple):
+  """One byte run a tensor needs, with its destination buffer."""
+
+  offset: int  # Absolute byte offset of the run in the file.
+  length: int  # Length of the run in bytes.
+  dst: np.ndarray  # Flat `uint8` destination view, `length` bytes long.
+
+
+class _ChunkWrite(NamedTuple):
+  """One precomputed chunk-to-buffer copy."""
+
+  dst: np.ndarray  # Flat `uint8` destination view, sliced to the copy length.
+  start: int  # Chunk-local start of the source bytes.
+  stop: int  # Chunk-local end of the source bytes.
+
+
+class _ChunkRead(NamedTuple):
+  """One ranged read and the buffer copies its bytes serve."""
+
+  offset: int  # Absolute byte offset of the read.
+  length: int  # Length of the read in bytes.
+  writes: tuple[_ChunkWrite, ...]
 
 
 class _ReadStats(NamedTuple):
   """Per-file read accounting, aggregated for the fragmentation hint."""
 
-  needed_bytes: int  # Bytes the registered runs actually need.
+  needed_bytes: int  # Bytes the planned runs actually need.
   read_bytes: int  # Bytes the coalesced blocks pull (>= needed_bytes).
   num_reads: int  # Coalesced blocks (ranged-read requests; ~1 per file ideal).
-  num_gets: int  # Actual storage GETs (>= num_reads; splits blocks > budget).
+  num_gets: int  # Actual storage GETs (>= num_reads; blocks split per chunk).
 
 
-class _PerFileScheduler:
-  """Coalesces and issues reads for one safetensors file.
+def _plan_chunk_reads(
+    reads: Sequence[_Read],
+    max_over_read_ratio: float,
+    chunk_bytes: int,
+) -> tuple[list[_ChunkRead], _ReadStats]:
+  """Plans the ranged reads serving one file's byte runs.
 
-  Callers `register(offset, length, callback)` synchronously while they plan
-  their per-tensor reads. After all registrations complete, `execute()`
-  partitions the registered runs under the over-read ratio cap, then for
-  each coalesced block issues one ranged read -- or streams the block in
-  budget-sized chunks if it exceeds `max_in_flight_bytes`. Each chunk's
-  bytes are dispatched to every registered callback whose range intersects
-  it, sliced to the run-local bytes the callback expects.
+  The runs are coalesced into blocks under the over-read ratio cap
+  (`_partition_runs`), then each block is split at `chunk_bytes` so that a
+  large block becomes several concurrent ranged reads instead of one long
+  single-stream read. Every chunk carries its precomputed buffer copies, so
+  chunks can complete in any order and no per-run state is needed at read
+  time.
 
-  Callback contract: a callback for a registered run may be invoked
-  multiple times, always in increasing offset order, each invocation
-  carrying a contiguous sub-range of the run's bytes. The callback should
-  write the bytes into its destination buffer starting at the cursor
-  position equal to "total bytes already delivered to this callback." The
-  helpers `_register_*_tensor_reads` in this file follow that pattern.
+  Args:
+    reads: The byte runs to serve, each with its destination buffer.
+    max_over_read_ratio: Upper bound on `block_size / needed_bytes` per block.
+    chunk_bytes: Maximum size of one ranged read. Must be positive and at
+      most the in-flight byte budget, so any single chunk can be reserved.
 
-  Concurrency: `register()` must finish for every tensor that touches this
-  file before `execute()` runs; otherwise a late registration would be
-  silently dropped. The `SafetensorsLayout._load` orchestration arranges
-  this by performing all registrations synchronously before scheduling any
-  scheduler `execute()` task. Peak in-flight memory is bounded at the
-  shared budget regardless of how many schedulers run concurrently.
+  Returns:
+    The chunk reads covering every run, and the file's read accounting.
   """
+  blocks = _partition_runs(
+      [(r.offset, r.length) for r in reads], max_over_read_ratio
+  )
+  chunks: list[_ChunkRead] = []
+  for block in blocks:
+    members = block.members  # Sorted by run offset (see `_partition_runs`).
+    first = 0
+    for pos in range(block.start, block.end, chunk_bytes):
+      chunk_end = min(pos + chunk_bytes, block.end)
+      # Runs are offset-sorted, so a member fully below `pos` stays consumed
+      # for every later chunk of this block.
+      while first < len(members):
+        r = reads[members[first]]
+        if r.offset + r.length > pos:
+          break
+        first += 1
+      writes = []
+      for member in itertools.islice(members, first, None):
+        r = reads[member]
+        if r.offset >= chunk_end:
+          break
+        lo = max(r.offset, pos)
+        hi = min(r.offset + r.length, chunk_end)
+        if lo < hi:
+          writes.append(
+              _ChunkWrite(
+                  dst=r.dst[lo - r.offset : hi - r.offset],
+                  start=lo - pos,
+                  stop=hi - pos,
+              )
+          )
+      chunks.append(_ChunkRead(pos, chunk_end - pos, tuple(writes)))
+  return chunks, _ReadStats(
+      needed_bytes=sum(r.length for r in reads),
+      read_bytes=sum(b.end - b.start for b in blocks),
+      num_reads=len(blocks),
+      num_gets=len(chunks),
+  )
 
-  def __init__(
-      self,
-      path: Path,
-      byte_budget: limits.LimitInFlightBytes,
-      max_over_read_ratio: float,
-  ):
-    self._path = path
-    self._budget = byte_budget
-    self._max_over_read_ratio = max_over_read_ratio
-    self._requests: list[tuple[int, int, _RunCallback]] = []
 
-  def register(self, offset: int, length: int, callback: _RunCallback) -> None:
-    """Records a byte range this host needs and the callback to receive it."""
-    self._requests.append((offset, length, callback))
+async def _read_chunk(
+    path: Path, chunk: _ChunkRead, byte_budget: limits.LimitInFlightBytes
+) -> None:
+  """Reads one chunk and copies its bytes into the destination buffers.
 
-  async def execute(self) -> _ReadStats:
-    """Reads all registered byte runs and returns this file's read accounting."""
-    if not self._requests:
-      return _ReadStats(needed_bytes=0, read_bytes=0, num_reads=0, num_gets=0)
-    runs = [(off, length) for off, length, _ in self._requests]
-    blocks = _partition_runs(runs, self._max_over_read_ratio)
-    try:
-      gets_per_block = await asyncio.gather(
-          *[self._read_block(b) for b in blocks]
-      )
-    finally:
-      # Drop callback closures so any buffers they captured can be GC'd as
-      # soon as their callers release them.
-      self._requests = []
-    return _ReadStats(
-        needed_bytes=sum(length for _, length in runs),
-        read_bytes=sum(b.end - b.start for b in blocks),
-        num_reads=len(blocks),
-        num_gets=sum(gets_per_block),
-    )
+  Args:
+    path: The file to read from. Each read opens its own handle, so chunks
+      are safe to issue concurrently.
+    chunk: The byte range to read and the buffer copies it serves.
+    byte_budget: The shared in-flight byte limiter; the chunk's bytes stay
+      reserved until they have been copied out.
+  """
+  async with limits.reserved_bytes(byte_budget, chunk.length):
+    async with async_path.open_file(path, mode="rb") as f:
+      await f.seek(chunk.offset)
+      # `AsyncFile.read` is declared `bytes | str`; `mode="rb"` guarantees
+      # bytes at runtime but pytype can't narrow that statically.
+      data = cast(bytes, await f.read(chunk.length))
+    src = memoryview(data)
+    for w in chunk.writes:
+      w.dst[:] = np.frombuffer(src[w.start : w.stop], dtype=np.uint8)
 
-  async def _read_block(self, block: _CoalescedBlock) -> int:
-    """Reads one coalesced block, streaming in chunks if oversized.
 
-    Args:
-      block: The coalesced byte range to read from this file.
+async def _read_file(
+    path: Path,
+    reads: Sequence[_Read],
+    byte_budget: limits.LimitInFlightBytes,
+    max_over_read_ratio: float,
+    chunk_bytes: int,
+) -> _ReadStats:
+  """Serves all of one file's byte runs with concurrent ranged reads.
 
-    Returns:
-      The number of storage GETs issued for the block -- one per chunk, so a
-      block within the in-flight budget is a single GET and a larger one is
-      several.
-    """
-    # `LimitInFlightBytes` reserves strictly fewer bytes than its max, and the
-    # limiter is sized one over `max_in_flight_bytes` (see `_load`), so the
-    # largest reservable chunk is exactly `max_in_flight_bytes`.
-    chunk_cap = self._budget.max_bytes - 1
-    pos = block.start
-    gets = 0
-    while pos < block.end:
-      chunk_end = min(pos + chunk_cap, block.end)
-      chunk_len = chunk_end - pos
-      async with limits.reserved_bytes(self._budget, chunk_len):
-        async with async_path.open_file(self._path, mode="rb") as f:
-          await f.seek(pos)
-          # `AsyncFile.read` is declared `bytes | str`; `mode="rb"` guarantees
-          # bytes at runtime but pytype can't narrow that statically.
-          chunk_bytes = cast(bytes, await f.read(chunk_len))
-        mv = memoryview(chunk_bytes)
-        self._dispatch_chunk(block, mv, pos, chunk_len)
-        # Drop our refs; the buffer can be GC'd once any memoryviews the
-        # callbacks may have retained go out of scope.
-        del mv, chunk_bytes
-      gets += 1
-      pos = chunk_end
-    return gets
+  Args:
+    path: The `.safetensors` file to read from.
+    reads: The byte runs this host needs from the file.
+    byte_budget: The shared in-flight byte limiter (shared across files).
+    max_over_read_ratio: Upper bound on `block_size / needed_bytes` per block.
+    chunk_bytes: Maximum size of one ranged read.
 
-  def _dispatch_chunk(
-      self,
-      block: _CoalescedBlock,
-      mv: memoryview,
-      chunk_start: int,
-      chunk_len: int,
-  ) -> None:
-    """Invokes every member's callback with the slice of `mv` it owns.
-
-    For each registered run in `block`, computes the intersection with the
-    chunk `[chunk_start, chunk_start + chunk_len)` and -- if non-empty --
-    invokes the callback with the corresponding slice of `mv`. Runs that do
-    not intersect this chunk are skipped (they will be served by another
-    chunk in the same block).
-
-    Args:
-      block: The coalesced block whose member runs may intersect the chunk.
-      mv: A memoryview over the bytes of the current chunk.
-      chunk_start: Absolute file offset where the chunk begins.
-      chunk_len: Length of the chunk in bytes.
-    """
-    chunk_end = chunk_start + chunk_len
-    for member_idx in block.members:
-      run_offset, run_length, callback = self._requests[member_idx]
-      run_end = run_offset + run_length
-      hit_start = max(chunk_start, run_offset)
-      hit_end = min(chunk_end, run_end)
-      if hit_start < hit_end:
-        local_start = hit_start - chunk_start
-        local_end = hit_end - chunk_start
-        callback(mv[local_start:local_end])
+  Returns:
+    The file's read accounting.
+  """
+  if not reads:
+    return _ReadStats(needed_bytes=0, read_bytes=0, num_reads=0, num_gets=0)
+  chunks, stats = _plan_chunk_reads(reads, max_over_read_ratio, chunk_bytes)
+  await asyncio.gather(*[_read_chunk(path, c, byte_budget) for c in chunks])
+  return stats
 
 
 def _allocate_buffer(
@@ -512,7 +543,7 @@ def _allocate_buffer(
 ) -> tuple[np.ndarray, np.ndarray]:
   """Allocates a contiguous buffer + a flat `uint8` view over its bytes.
 
-  The flat view is the canonical write-target for byte-level callbacks; it
+  The flat view is the canonical write-target for byte-level chunk copies; it
   works uniformly for scalars (`shape == ()`), 1-D, and N-D buffers, where
   `np.ndarray.view(uint8)` on a 0-D array does not.
 
@@ -530,83 +561,48 @@ def _allocate_buffer(
   return buf, flat_u8
 
 
-def _make_cursor_receive(dst: np.ndarray) -> _RunCallback:
-  """Builds a callback that appends successive chunks into a flat buffer.
-
-  Implements the partial-delivery contract from `_PerFileScheduler`: each
-  invocation writes the chunk's bytes at the cursor position and advances
-  the cursor by the chunk length. After all expected chunks arrive, the
-  cursor equals `len(dst)`.
-
-  Args:
-    dst: Flat destination buffer the chunks are written into.
-
-  Returns:
-    A callback that writes each received chunk at the running cursor.
-  """
-  cursor = [0]
-
-  def receive(chunk: memoryview) -> None:
-    n = len(chunk)
-    end = cursor[0] + n
-    dst[cursor[0] : end] = np.frombuffer(chunk, dtype=np.uint8)
-    cursor[0] = end
-
-  return receive
-
-
-def _register_whole_tensor_reads(
+def _plan_whole_tensor(
     entry: _FileEntry,
-    scheduler: _PerFileScheduler,
-) -> Callable[[], np.ndarray]:
-  """Sync: pre-allocates the destination array and registers one read.
+) -> tuple[list[_Read], Callable[[], np.ndarray]]:
+  """Plans one full-tensor read into a host array.
 
   Used when no `abstract_state` is given -- there is no target sharding to
   drive a partial read, so each tensor is materialised in full on this host.
-  The scheduler writes directly into the pre-allocated array; the returned
-  builder function just returns it.
+  The chunk reads write directly into the pre-allocated array; the returned
+  builder just returns it.
 
   Args:
     entry: The file entry describing the tensor's location and header info.
-    scheduler: The per-file read scheduler the read is registered with.
 
   Returns:
-    A builder that returns the fully materialised array after execution.
+    The tensor's byte runs, and a builder that returns the materialised
+    array once they have been read.
   """
   shape, dtype = _get_array_properties(entry.info)
   dtype = np.dtype(dtype)
   begin, end = entry.info["data_offsets"]
   buf, flat_u8 = _allocate_buffer(shape, dtype)
-  scheduler.register(
-      entry.data_start + begin, end - begin, _make_cursor_receive(flat_u8)
-  )
-
-  def build() -> np.ndarray:
-    return buf
-
-  return build
+  return [_Read(entry.data_start + begin, end - begin, flat_u8)], lambda: buf
 
 
-def _register_sharded_tensor_reads(
+def _plan_sharded_tensor(
     entry: _FileEntry,
     abstract_leaf: Any,
-    scheduler: _PerFileScheduler,
-) -> Callable[[], jax.Array]:
-  """Sync: pre-allocates one shard buffer per local-device shard.
+) -> tuple[list[_Read], Callable[[], jax.Array]]:
+  """Plans the shard reads this process's devices need for one tensor.
 
   For each unique index domain owned by one of this process's devices, the
-  shard buffer is allocated once. Each of the shard's byte runs is
-  registered with a callback that copies its bytes into the buffer at the
-  correct row offset. The returned builder turns the populated buffers
-  (after `scheduler.execute()`) into a sharded `jax.Array`.
+  shard buffer is allocated once, and each of the shard's byte runs targets
+  the prefix of that buffer it occupies. The returned builder turns the
+  populated buffers into a sharded `jax.Array`.
 
   Args:
     entry: The file entry describing the tensor's location and header info.
     abstract_leaf: The abstract array (shape, dtype, sharding) to build.
-    scheduler: The per-file read scheduler the reads are registered with.
 
   Returns:
-    A builder that assembles the populated shard buffers into a `jax.Array`.
+    The tensor's byte runs, and a builder that assembles the populated shard
+    buffers into a `jax.Array` once they have been read.
 
   Raises:
     ValueError: If the abstract state's shape disagrees with the checkpoint.
@@ -632,6 +628,7 @@ def _register_sharded_tensor_reads(
     if device.process_index == this_process:
       index_to_devices[_normalize_index(index, global_shape)].append(device)
 
+  reads: list[_Read] = []
   shard_specs: list[tuple[np.ndarray, list[jax.Device]]] = []
   for bounds, devices in index_to_devices.items():
     shard_shape = tuple(stop - start for start, stop in bounds)
@@ -644,11 +641,7 @@ def _register_sharded_tensor_reads(
     write_offset = 0
     for off, length in runs:
       end_byte = write_offset + length
-      scheduler.register(
-          off,
-          length,
-          _make_cursor_receive(shard_flat_u8[write_offset:end_byte]),
-      )
+      reads.append(_Read(off, length, shard_flat_u8[write_offset:end_byte]))
       write_offset = end_byte
     shard_specs.append((shard_buf, devices))
 
@@ -674,7 +667,7 @@ def _register_sharded_tensor_reads(
         global_shape, sharding, arrays, dtype=out_dtype
     )
 
-  return build
+  return reads, build
 
 
 def _record_read_stats(stats: Sequence[_ReadStats]) -> None:
@@ -686,13 +679,13 @@ def _record_read_stats(stats: Sequence[_ReadStats]) -> None:
   `/jax/orbax/read/...`, so a benchmark can capture safetensors reads through
   the standard jax.monitoring listener with no dependency on this loader.
 
-  Two read counts are reported: `num_reads` is the coalesced ranged-read
-  requests (~1 per file when fully coalesced), and `storage_reads` is the
-  actual GETs issued, which is >= `num_reads` because a block larger than the
-  in-flight budget is fetched in several chunks.
+  Two read counts are reported: `num_reads` is the coalesced blocks (~1 per
+  file when fully coalesced), and `storage_reads` is the actual GETs issued,
+  which is >= `num_reads` because a block larger than the read chunk size is
+  fetched as several concurrent ranged reads.
 
   Args:
-    stats: Per-file read accounting from each scheduler's `execute()`.
+    stats: Per-file read accounting from each file's reads.
   """
   jax.monitoring.record_scalar(
       "/jax/orbax/read/safetensors/bytes_read",
@@ -725,7 +718,7 @@ def _warn_if_reads_fragmented(
   load genuinely spans many files."
 
   Args:
-    stats: Per-file read accounting from each scheduler's `execute()`.
+    stats: Per-file read accounting from each file's reads.
     num_files: Number of distinct files the load read from.
     max_over_read_ratio_is_default: Whether the user left `max_over_read_ratio`
       unset; only then is "raise the ratio" actionable advice.
@@ -820,15 +813,16 @@ class SafetensorsLayout(CheckpointLayout):
   ) -> metadata_types.CheckpointMetadata[AbstractCheckpointable]:
     """Returns the flat checkpoint metadata for the Safetensors checkpoint."""
     del checkpointable_name  # Safetensors is always flat; name is unused.
+    entries = await _read_all_headers(path)
+    stats = await asyncio.gather(
+        *[async_path.async_stat(file_path) for file_path, _, _ in entries]
+    )
+    commit_timestamp_nsecs = (
+        max(int(stat.mtime) for stat in stats) if stats else None
+    )
     item_metadata: dict[str, jax.ShapeDtypeStruct] = {}
     custom_metadata: dict[str, Any] = {}
-    commit_timestamp_nsecs: int | None = None
-    for file_path in await _discover_files(path):
-      header, _ = await _read_header(file_path)
-      stat = await async_path.async_stat(file_path)
-      ts = int(stat.mtime)
-      if commit_timestamp_nsecs is None or ts > commit_timestamp_nsecs:
-        commit_timestamp_nsecs = ts
+    for _, header, _ in entries:
       for name, info in header.items():
         if name == "__metadata__":
           if info:
@@ -901,10 +895,12 @@ class SafetensorsLayout(CheckpointLayout):
 
   async def _build_file_index(self, path: Path) -> dict[str, _FileEntry]:
     """Maps each tensor name to where to find it (`_FileEntry`)."""
+    entries = await _read_all_headers(path)
+    await asyncio.gather(
+        *[_check_file_length(f, header, ds) for f, header, ds in entries]
+    )
     file_index: dict[str, _FileEntry] = {}
-    for file_path in await _discover_files(path):
-      header, data_start = await _read_header(file_path)
-      await _check_file_length(file_path, header, data_start)
+    for file_path, header, data_start in entries:
       for name, info in header.items():
         if name == "__metadata__":
           continue
@@ -918,7 +914,7 @@ class SafetensorsLayout(CheckpointLayout):
       file_index: dict[str, _FileEntry],
       abstract_state: dict[str, Any] | None,
   ) -> dict[str, Any]:
-    """Background load phase: registers reads, runs schedulers, assembles."""
+    """Background load phase: plans reads, reads files, assembles arrays."""
     context = context_lib.get_context()
     opts = context.safetensors_options
     max_over_read_ratio = (
@@ -928,28 +924,22 @@ class SafetensorsLayout(CheckpointLayout):
     )
     # In-flight read bytes reuse the shared restore knob,
     # `MemoryOptions.read_concurrent_bytes` (the same limit TensorStore restore
-    # uses). `None` means "no limit" there, but the streaming/chunk-sizing here
-    # needs a finite budget, so fall back to the loader default.
+    # uses). `None` means "no limit" there, but the chunk sizing here needs a
+    # finite budget, so fall back to the loader default.
     read_concurrent_bytes = context.memory_options.read_concurrent_bytes
     max_in_flight_bytes = (
         read_concurrent_bytes
         if read_concurrent_bytes is not None
         else _DEFAULT_MAX_IN_FLIGHT_BYTES
     )
-    # One shared limiter across every file's scheduler. Peak in-flight memory
-    # for the entire load is bounded at `max_in_flight_bytes` regardless of
-    # how many files or how large each file is. `LimitInFlightBytes` reserves
-    # strictly fewer bytes than its max, so size it one over: a single chunk
-    # can then reserve the full `max_in_flight_bytes`, and concurrent
-    # reservations still sum to at most `max_in_flight_bytes`.
+    chunk_bytes = min(_DEFAULT_READ_CHUNK_BYTES, max_in_flight_bytes)
+    # One shared limiter across every file. Peak in-flight memory for the
+    # entire load is bounded at `max_in_flight_bytes` regardless of how many
+    # files or how large each file is. `LimitInFlightBytes` reserves strictly
+    # fewer bytes than its max, so size it one over: a single chunk can then
+    # reserve the full `max_in_flight_bytes`, and concurrent reservations
+    # still sum to at most `max_in_flight_bytes`.
     byte_budget = limits.LimitInFlightBytes(max_in_flight_bytes + 1)
-    schedulers: dict[Path, _PerFileScheduler] = {}
-
-    def scheduler_for(file_path: Path) -> _PerFileScheduler:
-      if (sched := schedulers.get(file_path)) is None:
-        sched = _PerFileScheduler(file_path, byte_budget, max_over_read_ratio)
-        schedulers[file_path] = sched
-      return sched
 
     if abstract_state is None:
       if multihost.process_count() > 1:
@@ -965,30 +955,47 @@ class SafetensorsLayout(CheckpointLayout):
           )
       names = sorted(abstract_state)
 
-    # Phase 1 (sync): register every byte range this process needs with the
-    # per-file schedulers and pre-allocate the destination buffers. Each
-    # register returns a `build()` that turns the (yet-unfilled) buffers
-    # into a `jax.Array` once the schedulers have run.
-    build_fns: list[Callable[[], Any]] = []
+    # Phase 1 (sync): compute every byte range this process needs, grouped by
+    # file, and pre-allocate the destination buffers. Each tensor's `build()`
+    # turns its (yet-unfilled) buffers into an array once its file is read.
+    reads_by_file: dict[Path, list[_Read]] = collections.defaultdict(list)
+    builds_by_file: dict[Path, list[tuple[str, Callable[[], Any]]]] = (
+        collections.defaultdict(list)
+    )
     for name in names:
       entry = file_index[name]
-      sched = scheduler_for(entry.path)
       if abstract_state is None:
-        build_fns.append(_register_whole_tensor_reads(entry, sched))
+        reads, build = _plan_whole_tensor(entry)
       else:
-        build_fns.append(
-            _register_sharded_tensor_reads(entry, abstract_state[name], sched)
-        )
+        reads, build = _plan_sharded_tensor(entry, abstract_state[name])
+      reads_by_file[entry.path].extend(reads)
+      builds_by_file[entry.path].append((name, build))
 
-    # Phase 2 (async): all reads in parallel, bounded by the shared limiter.
-    # The scheduler's callbacks fill the pre-allocated buffers in place; no
-    # intermediate byte slices are held in futures.
-    stats = await asyncio.gather(*[s.execute() for s in schedulers.values()])
+    # Phase 2 (async): every file's chunks in parallel, bounded together by
+    # the shared limiter. The chunk reads fill the pre-allocated buffers in
+    # place. As soon as one file completes, its tensors are assembled --
+    # overlapping host-to-device transfer with the remaining reads -- and
+    # their host buffers are released.
+    arrays: dict[str, Any] = {}
+
+    async def load_file(file_path: Path) -> _ReadStats:
+      stats = await _read_file(
+          file_path,
+          reads_by_file[file_path],
+          byte_budget,
+          max_over_read_ratio,
+          chunk_bytes,
+      )
+      # Drop the read plan so each shard's host memory can be released as
+      # `build()` moves it on-device.
+      del reads_by_file[file_path]
+      for name, build in builds_by_file[file_path]:
+        arrays[name] = build()
+      return stats
+
+    stats = await asyncio.gather(*map(load_file, list(reads_by_file)))
     _record_read_stats(stats)
     _warn_if_reads_fragmented(
-        stats, len(schedulers), opts.max_over_read_ratio is None
+        stats, len(builds_by_file), opts.max_over_read_ratio is None
     )
-
-    # Phase 3 (sync): build `jax.Array`s from the now-populated buffers.
-    arrays = [fn() for fn in build_fns]
-    return dict(zip(names, arrays))
+    return {name: arrays[name] for name in names}
