@@ -1238,14 +1238,18 @@ class BasePyTreeCheckpointHandler(
           param_infos, checkpoint_dir, self._array_metadata_store
       )
 
-    await self._write_metadata_file(
-        checkpoint_dir,
-        param_infos=param_infos,
-        save_args=save_args,
-        custom_metadata=custom_metadata,
-        use_ocdbt=use_ocdbt,
-        use_zarr3=use_zarr3,
-    )
+    tasks = [
+        self._write_metadata_file(
+            checkpoint_dir,
+            param_infos=param_infos,
+            save_args=save_args,
+            custom_metadata=custom_metadata,
+            use_ocdbt=use_ocdbt,
+            use_zarr3=use_zarr3,
+        )
+    ]
+    await asyncio.gather(*tasks)
+
     end_time = time.time()
     logging.info(
         '[process=%s][thread=%s] Commit + Array metadata written. Time taken:'
