@@ -65,6 +65,7 @@ from orbax.checkpoint._src.serialization import type_handlers
 from orbax.checkpoint._src.testing import multiprocess_test
 
 
+
 FLAGS = flags.FLAGS
 register_with_handler = args.register_with_handler
 TrainState = train_state.TrainState
@@ -1431,6 +1432,23 @@ class CheckpointManagerTest(
         manager.save(step, args=args.PyTreeSave(self.pytree))
       self.wait_if_async(manager)
       self.assertSameElements([0, preemption_step, 4, 8], manager.all_steps())
+
+  @parameterized.parameters(True, False)
+  @mock.patch.object(jax.monitoring, 'record_scalar')
+  def test_init_telemetry_continuous_checkpointing(
+      self, enable_cc, mock_record_scalar
+  ):
+    if enable_cc:
+      options = CheckpointManagerOptions(
+          save_decision_policy=save_decision_policy_lib.ContinuousCheckpointingPolicy(),
+      )
+    else:
+      options = CheckpointManagerOptions()
+    with CheckpointManager(self.directory, options=options) as _:
+      mock_record_scalar.assert_any_call(
+          '/jax/orbax/checkpoint_manager/continuous_checkpointing_enabled',
+          int(enable_cc),
+      )
 
   def test_metadata(self):
     metadata = {

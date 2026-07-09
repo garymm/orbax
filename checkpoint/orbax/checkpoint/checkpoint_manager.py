@@ -938,6 +938,10 @@ class CheckpointManager(AbstractCheckpointManager, epy.ContextManager):
         self.directory,
         self,
     )
+    jax.monitoring.record_scalar(
+        '/jax/orbax/checkpoint_manager/continuous_checkpointing_enabled',
+        int(self._is_continuous_checkpointing_enabled()),
+    )
 
   def _maybe_await_cleanup_tmp_directory(self):
     if self._cleanup_tmp_directory_future is None:
@@ -1443,6 +1447,7 @@ class CheckpointManager(AbstractCheckpointManager, epy.ContextManager):
       jax.monitoring.record_event_duration_secs(
           '/jax/orbax/checkpoint_manager/time_between_consecutive_saves_secs',
           step_stats.time_between_consecutive_saves_sec,
+          continuous_checkpointing_enabled=self._is_continuous_checkpointing_enabled(),
       )
     self.wait_until_finished()
     step_stats.wait_for_prev_duration_secs = self._wait_for_prev_save_duration
@@ -1593,6 +1598,19 @@ class CheckpointManager(AbstractCheckpointManager, epy.ContextManager):
     )
     self._logger.log_entry(dataclasses.asdict(step_stats))
     return True
+
+  def _is_continuous_checkpointing_enabled(self) -> bool:
+    """Returns True if continuous checkpointing is enabled."""
+    decision_policy = self._options.save_decision_policy
+    policies = (
+        decision_policy.policies
+        if isinstance(decision_policy, save_decision_policy_lib.AnySavePolicy)
+        else [decision_policy]
+    )
+    return any(
+        isinstance(p, save_decision_policy_lib.ContinuousCheckpointingPolicy)
+        for p in policies
+    )
 
   def _maybe_get_default_item(
       self, composite_result: args_lib.Composite
