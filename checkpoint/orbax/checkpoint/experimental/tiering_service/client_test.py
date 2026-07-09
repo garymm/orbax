@@ -14,13 +14,17 @@
 
 """Unit tests for the CTS Client library and utility modules."""
 
+import asyncio
 import unittest
 from unittest import mock
+
 import grpc
 from orbax.checkpoint.experimental.tiering_service import client
 from orbax.checkpoint.experimental.tiering_service import client_auth
 from orbax.checkpoint.experimental.tiering_service import environment
 from orbax.checkpoint.experimental.tiering_service.proto import tiering_service_pb2
+
+from google.protobuf import timestamp_pb2
 
 
 class EnvironmentTest(unittest.IsolatedAsyncioTestCase):
@@ -325,6 +329,328 @@ class TieringClientTest(unittest.IsolatedAsyncioTestCase):
     with self.assertRaises(RuntimeError) as context:
       await client_inst.reserve(path="logical/path")
     self.assertIn("Reserve RPC failed", str(context.exception))
+
+  @mock.patch("grpc.aio.insecure_channel")
+  @mock.patch(
+      "orbax.checkpoint.experimental.tiering_service.proto.tiering_service_pb2_grpc.TieringServiceStub"
+  )
+  @mock.patch(
+      "orbax.checkpoint.experimental.tiering_service.client_auth.get_oauth_token"
+  )
+  @mock.patch(
+      "orbax.checkpoint.experimental.tiering_service.environment.get_gcp_zone"
+  )
+  @mock.patch(
+      "orbax.checkpoint.experimental.tiering_service.environment.get_gcp_region"
+  )
+  @mock.patch(
+      "orbax.checkpoint.experimental.tiering_service.environment.get_current_user"
+  )
+  async def test_reserve_starts_and_stops_keep_alive(
+      self,
+      mock_get_user,
+      mock_get_region,
+      mock_get_zone,
+      mock_get_token,
+      mock_stub_class,
+      mock_insecure_channel,
+  ):
+    mock_insecure_channel.return_value = self.insecure_channel_mock
+    mock_stub_class.return_value = self.stub_mock
+    mock_get_token.return_value = "fake-token"
+    mock_get_zone.return_value = "us-east5-a"
+    mock_get_region.return_value = "us-east5"
+    mock_get_user.return_value = "test-user"
+
+    original_sleep = asyncio.sleep
+    with mock.patch(
+        "orbax.checkpoint.experimental.tiering_service.client.asyncio.sleep"
+    ) as mock_sleep:
+
+      async def mock_sleep_fn(delay):
+        if delay == 0:
+          await original_sleep(0)
+        else:
+          return None
+
+      mock_sleep.side_effect = mock_sleep_fn
+
+      backend_l0 = tiering_service_pb2.StorageBackend(level=0, prefix="/lustre")
+      tp_l0 = tiering_service_pb2.TierPath(
+          storage_backend=backend_l0,
+          path="/lustre/path1",
+          tier_path_uuid="tp-uuid-1",
+      )
+      asset = tiering_service_pb2.Asset(uuid="asset-1", tier_paths=[tp_l0])
+      self.stub_mock.Reserve.return_value = tiering_service_pb2.ReserveResponse(
+          asset=asset,
+          keep_alive_interval_seconds=10,
+          tier_path_uuid="tp-uuid-1",
+      )
+
+      client_inst = client.TieringClient()
+      uuid, _ = await client_inst.reserve(path="logical/path")
+
+      self.assertEqual(uuid, "asset-1")
+      self.assertIn(("asset-1", client.JobType.WRITE), client_inst._keep_alives)
+      manager_task = client_inst._keep_alive_manager_task
+      assert manager_task is not None
+      self.assertFalse(manager_task.done())
+
+      self.stub_mock.Finalize.return_value = (
+          tiering_service_pb2.FinalizeResponse()
+      )
+      await client_inst.finalize(uuid="asset-1")
+      await asyncio.sleep(0)  # Allow keep-alive task updates to propagate
+
+      self.assertNotIn(
+          ("asset-1", client.JobType.WRITE), client_inst._keep_alives
+      )
+
+  @mock.patch("grpc.aio.insecure_channel")
+  @mock.patch(
+      "orbax.checkpoint.experimental.tiering_service.proto.tiering_service_pb2_grpc.TieringServiceStub"
+  )
+  @mock.patch(
+      "orbax.checkpoint.experimental.tiering_service.client_auth.get_oauth_token"
+  )
+  @mock.patch(
+      "orbax.checkpoint.experimental.tiering_service.environment.get_gcp_zone"
+  )
+  @mock.patch(
+      "orbax.checkpoint.experimental.tiering_service.environment.get_gcp_region"
+  )
+  async def test_prefetch_resolves_immediately_if_ready(
+      self,
+      mock_get_region,
+      mock_get_zone,
+      mock_get_token,
+      mock_stub_class,
+      mock_insecure_channel,
+  ):
+    mock_insecure_channel.return_value = self.insecure_channel_mock
+    mock_stub_class.return_value = self.stub_mock
+    mock_get_token.return_value = "fake-token"
+    mock_get_zone.return_value = "us-east5-a"
+    mock_get_region.return_value = "us-east5"
+
+    ready_time = timestamp_pb2.Timestamp(seconds=123456)
+    backend_l0 = tiering_service_pb2.StorageBackend(level=0, prefix="/lustre")
+    tp_l0 = tiering_service_pb2.TierPath(
+        storage_backend=backend_l0,
+        path="/lustre/path1",
+        ready_at=ready_time,
+        tier_path_uuid="tp-uuid-2",
+    )
+    asset = tiering_service_pb2.Asset(uuid="asset-2", tier_paths=[tp_l0])
+    self.stub_mock.Prefetch.return_value = tiering_service_pb2.PrefetchResponse(
+        asset=asset,
+        keep_alive_interval_seconds=10,
+        closest_tier_path_uuid="tp-uuid-2",
+    )
+
+    client_inst = client.TieringClient()
+    future = await client_inst.prefetch(path="logical/path")
+    self.assertTrue(future.done())
+    self.assertEqual(await future, "/lustre/path1")
+    self.stub_mock.Prefetch.assert_called_once()
+    args, kwargs = self.stub_mock.Prefetch.call_args
+    request = args[0]
+    self.assertEqual(request.path, "logical/path")
+    self.assertFalse(request.HasField("uuid"))
+    self.assertEqual(request.zone, "us-east5-a")
+    self.assertEqual(request.region, "us-east5")
+    self.assertEqual(
+        kwargs["metadata"], [("authorization", "Bearer fake-token")]
+    )
+    self.assertIn(
+        ("asset-2", client.JobType.PREFETCH), client_inst._keep_alives
+    )
+    await client_inst.release("asset-2")
+    self.assertNotIn(
+        ("asset-2", client.JobType.PREFETCH), client_inst._keep_alives
+    )
+
+  @mock.patch("grpc.aio.insecure_channel")
+  @mock.patch(
+      "orbax.checkpoint.experimental.tiering_service.proto.tiering_service_pb2_grpc.TieringServiceStub"
+  )
+  @mock.patch(
+      "orbax.checkpoint.experimental.tiering_service.client_auth.get_oauth_token"
+  )
+  @mock.patch(
+      "orbax.checkpoint.experimental.tiering_service.environment.get_gcp_zone"
+  )
+  @mock.patch(
+      "orbax.checkpoint.experimental.tiering_service.environment.get_gcp_region"
+  )
+  async def test_prefetch_polls_and_resolves(
+      self,
+      mock_get_region,
+      mock_get_zone,
+      mock_get_token,
+      mock_stub_class,
+      mock_insecure_channel,
+  ):
+    mock_insecure_channel.return_value = self.insecure_channel_mock
+    mock_stub_class.return_value = self.stub_mock
+    mock_get_token.return_value = "fake-token"
+    mock_get_zone.return_value = "us-east5-a"
+    mock_get_region.return_value = "us-east5"
+
+    original_sleep = asyncio.sleep
+    with mock.patch(
+        "orbax.checkpoint.experimental.tiering_service.client.asyncio.sleep"
+    ) as mock_sleep, mock.patch(
+        "orbax.checkpoint.experimental.tiering_service.client.asyncio.wait_for"
+    ) as mock_wait_for:
+
+      async def mock_sleep_fn(delay):
+        if delay == 0:
+          await original_sleep(0)
+        else:
+          return None
+
+      mock_sleep.side_effect = mock_sleep_fn
+
+      async def mock_wait_for_fn(fut, timeout=None):
+        if timeout == 0:
+          return await fut
+        fut.close()
+        raise asyncio.TimeoutError()
+
+      mock_wait_for.side_effect = mock_wait_for_fn
+
+      backend_l0 = tiering_service_pb2.StorageBackend(level=0, prefix="/lustre")
+      tp_l0 = tiering_service_pb2.TierPath(
+          storage_backend=backend_l0,
+          path="/lustre/path1",
+          tier_path_uuid="tp-uuid-3",
+      )
+      asset_not_ready = tiering_service_pb2.Asset(
+          uuid="asset-3", tier_paths=[tp_l0]
+      )
+      self.stub_mock.Prefetch.return_value = (
+          tiering_service_pb2.PrefetchResponse(
+              asset=asset_not_ready,
+              keep_alive_interval_seconds=10,
+              closest_tier_path_uuid="tp-uuid-3",
+          )
+      )
+
+      client_inst = client.TieringClient()
+      future = await client_inst.prefetch(path="logical/path")
+
+      self.stub_mock.Prefetch.assert_called_once()
+      args, kwargs = self.stub_mock.Prefetch.call_args
+      request = args[0]
+      self.assertEqual(request.path, "logical/path")
+      self.assertFalse(request.HasField("uuid"))
+      self.assertEqual(request.zone, "us-east5-a")
+      self.assertEqual(request.region, "us-east5")
+      self.assertEqual(
+          kwargs["metadata"], [("authorization", "Bearer fake-token")]
+      )
+
+      self.assertFalse(future.done())
+      self.assertIn(
+          ("asset-3", client.JobType.PREFETCH), client_inst._keep_alives
+      )
+
+      resp_not_ready = tiering_service_pb2.PrefetchKeepAliveResponse(
+          keep_alive_interval_seconds=10, asset=asset_not_ready
+      )
+
+      ready_time = timestamp_pb2.Timestamp(seconds=123456)
+      tp_l0_ready = tiering_service_pb2.TierPath(
+          storage_backend=backend_l0,
+          path="/lustre/path1",
+          ready_at=ready_time,
+          tier_path_uuid="tp-uuid-3",
+      )
+      asset_ready = tiering_service_pb2.Asset(
+          uuid="asset-3", tier_paths=[tp_l0_ready]
+      )
+      resp_ready = tiering_service_pb2.PrefetchKeepAliveResponse(
+          keep_alive_interval_seconds=10, asset=asset_ready
+      )
+
+      self.stub_mock.PrefetchKeepAlive.side_effect = [
+          resp_not_ready,
+          resp_ready,
+          asyncio.CancelledError(),
+      ]
+
+      await asyncio.sleep(0)
+      await asyncio.sleep(0)
+
+      self.assertTrue(future.done())
+      self.assertEqual(await future, "/lustre/path1")
+
+      await client_inst.release("asset-3")
+      self.assertNotIn(
+          ("asset-3", client.JobType.PREFETCH), client_inst._keep_alives
+      )
+
+  @mock.patch("grpc.aio.insecure_channel")
+  @mock.patch(
+      "orbax.checkpoint.experimental.tiering_service.proto.tiering_service_pb2_grpc.TieringServiceStub"
+  )
+  @mock.patch(
+      "orbax.checkpoint.experimental.tiering_service.client_auth.get_oauth_token"
+  )
+  @mock.patch(
+      "orbax.checkpoint.experimental.tiering_service.environment.get_gcp_zone"
+  )
+  @mock.patch(
+      "orbax.checkpoint.experimental.tiering_service.environment.get_gcp_region"
+  )
+  async def test_prefetch_with_uuid(
+      self,
+      mock_get_region,
+      mock_get_zone,
+      mock_get_token,
+      mock_stub_class,
+      mock_insecure_channel,
+  ):
+    mock_insecure_channel.return_value = self.insecure_channel_mock
+    mock_stub_class.return_value = self.stub_mock
+    mock_get_token.return_value = "fake-token"
+    mock_get_zone.return_value = "us-east5-a"
+    mock_get_region.return_value = "us-east5"
+
+    ready_time = timestamp_pb2.Timestamp(seconds=123456)
+    backend_l0 = tiering_service_pb2.StorageBackend(level=0, prefix="/lustre")
+    tp_l0 = tiering_service_pb2.TierPath(
+        storage_backend=backend_l0,
+        path="/lustre/path1",
+        ready_at=ready_time,
+        tier_path_uuid="tp-uuid-2",
+    )
+    asset = tiering_service_pb2.Asset(
+        uuid="asset-uuid-5678", tier_paths=[tp_l0]
+    )
+    self.stub_mock.Prefetch.return_value = tiering_service_pb2.PrefetchResponse(
+        asset=asset,
+        keep_alive_interval_seconds=10,
+        closest_tier_path_uuid="tp-uuid-2",
+    )
+
+    client_inst = client.TieringClient()
+    future = await client_inst.prefetch(uuid="asset-uuid-5678")
+    self.assertTrue(future.done())
+    self.assertEqual(await future, "/lustre/path1")
+
+    self.stub_mock.Prefetch.assert_called_once()
+    args, kwargs = self.stub_mock.Prefetch.call_args
+    request = args[0]
+    self.assertEqual(request.uuid, "asset-uuid-5678")
+    self.assertFalse(request.HasField("path"))
+    self.assertEqual(request.zone, "us-east5-a")
+    self.assertEqual(request.region, "us-east5")
+    self.assertEqual(
+        kwargs["metadata"], [("authorization", "Bearer fake-token")]
+    )
 
 
 if __name__ == "__main__":
