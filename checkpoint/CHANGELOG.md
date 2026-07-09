@@ -16,10 +16,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 - #v1 Drive the safetensors load by the target sharding: each process reads
 only the byte ranges its own devices need (coalesced under
-`SafetensorsOptions.max_over_read_ratio`, fetched as concurrent fixed-size
-ranged reads bounded by `MemoryOptions.read_concurrent_bytes`), replacing
-the transient-array resharding load. Supports arbitrary shardings,
-including inner-dimension partitions.
+`SafetensorsOptions.max_over_read_ratio`, fetched as concurrent ranged
+reads of `SafetensorsOptions.read_chunk_bytes` each, bounded by
+`MemoryOptions.read_concurrent_bytes`), replacing the transient-array
+resharding load. Supports arbitrary shardings, including inner-dimension
+partitions.
 
 ## [0.12.1] - 2026-06-24
 

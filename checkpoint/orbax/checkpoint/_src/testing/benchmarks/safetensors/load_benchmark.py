@@ -81,6 +81,12 @@ class SafetensorLoadBenchmarkOptions(benchmarks_core.BenchmarkOptions):
       TP variant to measure the read-count vs over-read tradeoff. `None`
       (default) uses the loader's default (currently 2.0). In-flight read bytes
       are bounded by `restore_concurrent_gb` (shared with the rest of restore).
+    safetensors_read_chunk_mb: Override for
+      `SafetensorsOptions.read_chunk_bytes`, in MiB. Coalesced blocks are
+      split at this size into concurrent ranged reads; sweep as
+      `[64, 128, 512]` to measure the request-count vs read-parallelism
+      tradeoff on a given storage backend. `None` (default) uses the loader's
+      default (currently 128 MiB).
     metric_tracemalloc_enabled: Whether to capture the tracemalloc metric
       (opt-in because its per-allocation snapshots are expensive).
   """
@@ -92,6 +98,7 @@ class SafetensorLoadBenchmarkOptions(benchmarks_core.BenchmarkOptions):
   use_load_and_broadcast: bool | list[bool] = False
   restore_concurrent_gb: int | None | list[int | None] = None
   safetensors_max_over_read_ratio: float | None | list[float | None] = None
+  safetensors_read_chunk_mb: int | None | list[int | None] = None
   metric_tracemalloc_enabled: bool = False
 
   def is_valid(self) -> bool:
@@ -105,6 +112,11 @@ class SafetensorLoadBenchmarkOptions(benchmarks_core.BenchmarkOptions):
         checkpoint_layout=ocp.options.CheckpointLayout.SAFETENSORS,
         safetensors_options=ocp.options.SafetensorsOptions(
             max_over_read_ratio=self.safetensors_max_over_read_ratio,
+            read_chunk_bytes=(
+                self.safetensors_read_chunk_mb * 1024**2
+                if self.safetensors_read_chunk_mb is not None
+                else None
+            ),
         ),
     )
     # TODO(b/519204863): Fix type hint for args like list[T] | T

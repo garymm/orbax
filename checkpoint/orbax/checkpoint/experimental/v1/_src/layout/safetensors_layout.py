@@ -70,7 +70,9 @@ AbstractCheckpointable = checkpoint_layout.AbstractCheckpointable
 HEADER_NUM_BYTES = 8
 SAFETENSORS_SUFFIX = ".safetensors"
 
-# Per-file scheduler defaults. SafetensorsOptions can override either.
+# Read-planning defaults. `SafetensorsOptions` overrides the over-read ratio
+# (`max_over_read_ratio`) and the chunk size (`read_chunk_bytes`); the
+# in-flight budget comes from `MemoryOptions.read_concurrent_bytes`.
 #
 # `_DEFAULT_MAX_OVER_READ_RATIO` caps `block_size / needed_bytes` for any
 # coalesced read; a host's bytes pulled from one file are bounded at
@@ -932,7 +934,16 @@ class SafetensorsLayout(CheckpointLayout):
         if read_concurrent_bytes is not None
         else _DEFAULT_MAX_IN_FLIGHT_BYTES
     )
-    chunk_bytes = min(_DEFAULT_READ_CHUNK_BYTES, max_in_flight_bytes)
+    read_chunk_bytes = (
+        opts.read_chunk_bytes
+        if opts.read_chunk_bytes is not None
+        else _DEFAULT_READ_CHUNK_BYTES
+    )
+    if read_chunk_bytes <= 0:
+      raise ValueError(
+          f"read_chunk_bytes must be positive, got {read_chunk_bytes}."
+      )
+    chunk_bytes = min(read_chunk_bytes, max_in_flight_bytes)
     # One shared limiter across every file. Peak in-flight memory for the
     # entire load is bounded at `max_in_flight_bytes` regardless of how many
     # files or how large each file is. `LimitInFlightBytes` reserves strictly

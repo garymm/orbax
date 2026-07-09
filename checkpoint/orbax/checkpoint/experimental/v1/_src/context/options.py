@@ -605,9 +605,18 @@ class SafetensorsOptions(_ActiveContextGuard):
       1.0 disables any over-read. Worst-case per-host bytes from one file are
       bounded at `max_over_read_ratio * ideal_bytes`. `None` selects an
       implementation default (currently `2.0`).
+    read_chunk_bytes: Target size of one ranged read. Coalesced blocks are
+      split at this size and the pieces are read concurrently, so it trades
+      storage request count against read parallelism: larger values issue
+      fewer requests (gentler on request-rate quotas), smaller values fetch
+      with more parallel streams. The effective chunk never exceeds the
+      in-flight budget (`MemoryOptions.read_concurrent_bytes`), which also
+      caps concurrent requests at `budget / read_chunk_bytes` per host.
+      `None` selects an implementation default (currently 128 MiB).
   """
 
   max_over_read_ratio: float | None = None
+  read_chunk_bytes: int | None = None
 
 
 class CheckpointLayout(enum.Enum):

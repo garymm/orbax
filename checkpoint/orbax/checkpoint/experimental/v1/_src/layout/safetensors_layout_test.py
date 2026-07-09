@@ -850,6 +850,38 @@ class SafetensorsLayoutEdgeCaseTest(
       pytree = await restore_fn
     np.testing.assert_allclose(pytree['a'], np.arange(8, dtype=np.float32))
 
+  async def test_read_chunk_bytes_option_splits_reads(self):
+    # One 32-byte tensor with a 16-byte chunk size: still one coalesced
+    # block, but two storage GETs. Pins that the option reaches the planner.
+    np_save_file({'a': np.arange(8, dtype=np.float32)}, self.file_path)
+    layout = SafetensorsLayout()
+    with mock.patch.object(jax.monitoring, 'record_scalar') as rec:
+      with context_lib.Context(
+          safetensors_options=options_lib.SafetensorsOptions(
+              read_chunk_bytes=16,
+          ),
+      ):
+        restore_fn = await layout.load(self.file_path)
+        pytree = await restore_fn
+    emitted = {c.args[0]: c.args[1] for c in rec.call_args_list}
+    self.assertEqual(emitted['/jax/orbax/read/safetensors/num_reads'], 1.0)
+    self.assertEqual(
+        emitted['/jax/orbax/read/safetensors/storage_reads'], 2.0
+    )
+    np.testing.assert_allclose(pytree['a'], np.arange(8, dtype=np.float32))
+
+  async def test_non_positive_read_chunk_bytes_raises(self):
+    np_save_file({'a': np.arange(8, dtype=np.float32)}, self.file_path)
+    layout = SafetensorsLayout()
+    with context_lib.Context(
+        safetensors_options=options_lib.SafetensorsOptions(
+            read_chunk_bytes=0,
+        ),
+    ):
+      restore_fn = await layout.load(self.file_path)
+      with self.assertRaisesRegex(ValueError, 'read_chunk_bytes'):
+        await restore_fn
+
 
 class SingleHostOneReadInvariantTest(
     unittest.IsolatedAsyncioTestCase, parameterized.TestCase
