@@ -71,7 +71,7 @@ class ProcessMetadataCheckpointHandler(
     Returns:
       A list of commit futures.
     """
-    logging.info('Saving process metadata to %s', directory)
+    logging.vlog(2, 'Saving process metadata to %s', directory)
     return [
         future.CommitFutureAwaitingContractedSignals(
             mesh_consistency.save_process_metadata(
@@ -113,7 +113,7 @@ class ProcessMetadataCheckpointHandler(
     Returns:
       A tuple of previous distributed to device ids and previous device ids.
     """
-    logging.info('Restoring process metadata from %s', directory)
+    logging.vlog(2, 'Restoring process metadata from %s', directory)
     return mesh_consistency.read_process_metadata(directory)
 
 

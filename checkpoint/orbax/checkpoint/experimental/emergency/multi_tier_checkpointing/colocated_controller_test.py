@@ -708,6 +708,9 @@ class ColocatedControllerInternalTest(parameterized.TestCase):
       self.assertTrue(handoff_started.wait(timeout=5))
       self.assertIsNotNone(controller._pending_save)
       self.assertIsNotNone(controller._pending_save.keepalive)
+      self.assertEqual(
+          controller._pending_save.payload_bytes, state['x'].nbytes
+      )
       self.assertTrue(controller.is_saving_in_progress())
       mock_save_dataset.assert_not_called()
 
@@ -788,13 +791,14 @@ class ColocatedControllerInternalTest(parameterized.TestCase):
     controller, _ = self._make_controller_for_restore()
     keepalive = (mock.sentinel.state,)
     result = object()
+    timer = mock.Mock()
     pending_save = controller_lib._PendingSave(
         step=9,
         force=False,
         result=result,
         keepalive=keepalive,
         dataset_args=None,
-        start_time=0.0,
+        payload_bytes=123,
     )
 
     with mock.patch.object(
@@ -803,12 +807,18 @@ class ColocatedControllerInternalTest(parameterized.TestCase):
         controller_lib.colocated_utils,
         'require_unanimous_scalar_result',
         return_value=True,
-    ):
+    ), mock.patch.object(
+        controller_lib, 'TimeBlock'
+    ) as mock_time_block:
+      mock_time_block.return_value.__enter__.return_value = timer
       saved = controller._save_lifecycle.await_handoff(pending_save)
 
     self.assertTrue(saved)
     mock_block.assert_called_once_with(result)
     self.assertIsNone(pending_save.keepalive)
+    timer.append_data.assert_called_once_with(
+        'checkpoint_size', 123, 'B', log_rate=True
+    )
 
   def test_worker_handoff_releases_keepalive_when_worker_does_not_save(
       self,
@@ -821,7 +831,6 @@ class ColocatedControllerInternalTest(parameterized.TestCase):
         result=result,
         keepalive=(mock.sentinel.state,),
         dataset_args=None,
-        start_time=0.0,
     )
 
     with mock.patch.object(
@@ -845,7 +854,6 @@ class ColocatedControllerInternalTest(parameterized.TestCase):
         result=result,
         keepalive=(mock.sentinel.state,),
         dataset_args=None,
-        start_time=0.0,
     )
 
     with mock.patch.object(
@@ -1606,7 +1614,6 @@ class ColocatedControllerInternalTest(parameterized.TestCase):
         result=mock.sentinel.result,
         keepalive=(mock.sentinel.state,),
         dataset_args=None,
-        start_time=0.0,
     )
 
     self.assertTrue(controller.is_saving_in_progress())
@@ -1621,7 +1628,6 @@ class ColocatedControllerInternalTest(parameterized.TestCase):
         result=mock.sentinel.result,
         keepalive=None,
         dataset_args=args_lib.Composite(dataset=mock.sentinel.dataset),
-        start_time=0.0,
         handoff_done=True,
         handoff_saved=True,
     )
@@ -1650,7 +1656,6 @@ class ColocatedControllerInternalTest(parameterized.TestCase):
         result=mock.sentinel.result,
         keepalive=None,
         dataset_args=None,
-        start_time=0.0,
         handoff_done=True,
         handoff_saved=True,
         saved=True,
@@ -1731,18 +1736,25 @@ class ColocatedControllerInternalTest(parameterized.TestCase):
     self._set_worker_restore_result(
         controller, return_value=restored_cpu_state
     )
+    restore_timer = mock.Mock()
+    transfer_timer = mock.Mock()
 
-    result = controller.restore(
-        7,
-        args_lib.Composite(
-            state=args_lib.PyTreeRestore(
-                item=template_state,
-                restore_args=restore_args,
-                partial_restore=True,
-            )
-        ),
-        default_item_mode=True,
-    )
+    with mock.patch.object(controller_lib, 'TimeBlock') as mock_time_block:
+      mock_time_block.return_value.__enter__.side_effect = (
+          restore_timer,
+          transfer_timer,
+      )
+      result = controller.restore(
+          7,
+          args_lib.Composite(
+              state=args_lib.PyTreeRestore(
+                  item=template_state,
+                  restore_args=restore_args,
+                  partial_restore=True,
+              )
+          ),
+          default_item_mode=True,
+      )
 
     controller._worker_manager.wait_until_finished.assert_not_called()
     controller._worker_manager.restore_infer.assert_called_once()
@@ -1763,6 +1775,12 @@ class ColocatedControllerInternalTest(parameterized.TestCase):
     )
     np.testing.assert_array_equal(
         np.asarray(result['weights']), np.arange(2, dtype=np.float32)
+    )
+    restore_timer.append_data.assert_called_once_with(
+        'restored_state_size', 12, 'B', log_rate=True
+    )
+    transfer_timer.append_data.assert_called_once_with(
+        'restored_state_size', 8, 'B', log_rate=True
     )
 
   def test_restore_rejects_protocol_no_checkpoint_sentinel(self):

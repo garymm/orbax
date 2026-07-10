@@ -54,7 +54,7 @@ def read_process_metadata(directory: epath.Path):
         f'Process metadata folder was not finalized at {metadata_folder}.'
         ' The local checkpoint cannot be restored.'
     )
-  logging.info('Loading process index metadata from %s', metadata_folder)
+  logging.vlog(2, 'Loading process index metadata from %s', metadata_folder)
 
   distributed_to_device_ids = json.loads(
       (metadata_folder / _GLOBAL_PROCESS_METADATA_FILE_NAME).read_text()
@@ -73,7 +73,7 @@ async def save_process_metadata(
   """Saves process metadata to local storage. Runs on every process."""
   metadata_folder = process_metadata_folder(directory)
   metadata_folder.mkdir(parents=True, exist_ok=True)
-  logging.info('Saving process index metadata at %s', metadata_folder)
+  logging.vlog(2, 'Saving process index metadata at %s', metadata_folder)
 
   (metadata_folder / _GLOBAL_PROCESS_METADATA_FILE_NAME).write_text(
       json.dumps(distributed_to_device_ids)
@@ -123,11 +123,14 @@ def consistent_restore_mesh_from_metadata(
     A mesh that is the same as the mesh used to save the local checkpoint.
   """
   assert isinstance(previous_device_ids, list)
-  logging.info(
+  logging.vlog(
+      2,
       'From process metadata, distributed_to_device_ids=%s',
       previous_distributed_to_device_ids,
   )
-  logging.info('From process metadata, device_ids=%s', previous_device_ids)
+  logging.vlog(
+      2, 'From process metadata, device_ids=%s', previous_device_ids
+  )
   consistent_mesh = emergency_multihost.consistent_restore_mesh(
       jax.devices(),
       global_mesh,
@@ -135,7 +138,8 @@ def consistent_restore_mesh_from_metadata(
       previous_distributed_to_device_ids=previous_distributed_to_device_ids,
       current_distributed_to_device_ids=current_distributed_to_device_ids,
   )
-  logging.info(
+  logging.vlog(
+      2,
       'Created consistent mesh with device_ids=%s',
       consistent_mesh.device_ids.flatten(),
   )
@@ -147,14 +151,11 @@ def consistent_restore_mesh_to_global_mesh(
     shardings: PyTree,
 ) -> PyTree:
   """Transfers from consistent restore mesh to global mesh."""
-  logging.info('Transferring from consistent restore mesh to global mesh')
-
   start_transfer = time.time()
   resharded_state = jax.device_put(state, shardings, donate=True)
   transfer_elapsed_s = time.time() - start_transfer
   logging.info(
-      'Finished transferring from consistent restore mesh to global mesh'
-      ' in %.2fs',
+      'Submitted transfer from consistent restore mesh to global mesh in %.2fs',
       transfer_elapsed_s,
   )
   jax.monitoring.record_event_duration_secs(

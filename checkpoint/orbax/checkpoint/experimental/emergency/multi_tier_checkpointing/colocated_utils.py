@@ -33,6 +33,19 @@ NO_STEP_SENTINEL = 0
 MAX_TRACKED_STEPS = 128
 
 
+def addressable_array_bytes(tree: PyTree) -> int:
+  """Returns bytes held by addressable array shards, including replicas."""
+  total_bytes = 0
+  for leaf in jax.tree.leaves(tree):
+    if isinstance(leaf, jax.Array):
+      total_bytes += sum(
+          int(shard.data.nbytes) for shard in leaf.addressable_shards
+      )
+    elif hasattr(leaf, 'nbytes'):
+      total_bytes += int(leaf.nbytes)
+  return total_bytes
+
+
 def value_sample(values: Any, limit: int = 8) -> str:
   """Returns a compact sample of values for topology logging."""
   values = tuple(values)
@@ -76,7 +89,7 @@ def compute_distributed_to_device_ids(
       list(ids) for ids in topology.distributed_to_device_ids
   ]
   logging.vlog(
-      1,
+      2,
       'Computed Pathways distributed_to_device_ids for %d workers: %s',
       len(distributed_to_device_ids),
       distributed_to_device_ids,

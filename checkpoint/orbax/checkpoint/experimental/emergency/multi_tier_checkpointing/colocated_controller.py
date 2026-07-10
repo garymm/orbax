@@ -16,6 +16,7 @@
 
 from collections.abc import Mapping
 import dataclasses
+import logging as python_logging
 import math
 import threading
 import time
@@ -40,12 +41,17 @@ from orbax.checkpoint.experimental.emergency.multi_tier_checkpointing import (
 from orbax.checkpoint.experimental.emergency.multi_tier_checkpointing import (
     pathways_topology,
 )
+from orbax.checkpoint.experimental.emergency.multi_tier_checkpointing.time_block import (
+    TimeBlock,
+)
 
 
 PyTree = Any
 _STATE_ITEM_NAME = 'state'
 _DATASET_ITEM_NAME = 'dataset'
 _LATEST_STEP_RETRY_TIMEOUT_SECS = 30
+# Abseil maps standard levels below DEBUG to increasing VLOG levels.
+_VLOG2_LEVEL = python_logging.DEBUG - 1
 _RETRIABLE_COLOCATED_CALL_EXCEPTIONS = (
     jax.errors.JaxRuntimeError,
     RuntimeError,
@@ -135,7 +141,7 @@ class _PendingSave:
   result: Any
   keepalive: tuple[Any, ...] | None
   dataset_args: args_lib.Composite | None
-  start_time: float
+  payload_bytes: int = 0
   handoff_thread: threading.Thread | None = None
   handoff_done: bool = False
   handoff_saved: bool | None = None
@@ -222,21 +228,18 @@ class _ControllerSaveHandoffLifecycle:
 
   def await_handoff(self, pending_save: _PendingSave) -> bool:
     """Waits for sidecar save result and releases controller anchors."""
-    block_start = time.time()
-    logging.vlog(
-        1,
-        'Pathways colocated MTC save step=%s: draining async worker handoff.',
-        pending_save.step,
-    )
-    jax.block_until_ready(pending_save.result)
-    logging.vlog(
-        1,
-        'Pathways colocated MTC save step=%s: async worker handoff ready '
-        'elapsed=%.3fs total_elapsed=%.3fs.',
-        pending_save.step,
-        time.time() - block_start,
-        time.time() - pending_save.start_time,
-    )
+    with TimeBlock(
+        f'Pathways colocated MTC save step={pending_save.step}: '
+        'wait for worker handoff',
+        level=python_logging.INFO,
+    ) as timer:
+      jax.block_until_ready(pending_save.result)
+      timer.append_data(
+          'checkpoint_size',
+          pending_save.payload_bytes,
+          'B',
+          log_rate=True,
+      )
     try:
       value = colocated_utils.require_unanimous_scalar_result(
           pending_save.result, op_name='save_handoff'
@@ -295,7 +298,7 @@ class _ControllerSaveHandoffLifecycle:
       with self._lock:
         pending_save.saved = saved
       logging.vlog(
-          1,
+          2,
           'Pathways colocated MTC save step=%s: drained async save saved=%s.',
           pending_save.step,
           saved,
@@ -323,7 +326,8 @@ class _ControllerSaveHandoffLifecycle:
       had_keepalive = pending_save.keepalive is not None
       pending_save.keepalive = None
     if had_keepalive:
-      logging.info(
+      logging.vlog(
+          2,
           'Pathways colocated MTC save step=%s: released controller async save '
           'payload anchors: %s.',
           pending_save.step,
@@ -339,22 +343,7 @@ class _ControllerSaveHandoffLifecycle:
     saved = self._drain(pending_save, wait=True)
     try:
       if pending_save.saved:
-        wait_start = time.time()
-        logging.info(
-            'Pathways colocated MTC save step=%s: waiting for worker-side'
-            ' async save finalization.',
-            pending_save.step,
-        )
         self._worker_wait_until_finished()
-        logging.info(
-            'Pathways colocated MTC save step=%s: worker-side async save'
-            ' finalizer wait returned wait_elapsed=%.3fs'
-            ' pending_save_age=%.3fs. This is controller observation time, not'
-            ' payload anchor lifetime or worker save duration.',
-            pending_save.step,
-            time.time() - wait_start,
-            time.time() - pending_save.start_time,
-        )
       return saved
     finally:
       step = pending_save.step
@@ -362,7 +351,8 @@ class _ControllerSaveHandoffLifecycle:
       with self._lock:
         if self._pending_save is pending_save:
           self._pending_save = None
-      logging.info(
+      logging.vlog(
+          2,
           'Pathways colocated MTC save step=%s: finished pending async save'
           ' lifecycle.',
           step,
@@ -461,18 +451,23 @@ def _call_worker_restore_infer(
       in_specs=in_specs,
       devices=state_cpu_devices,
   )
-  restore_start = time.time()
-  logging.info(
-      'Pathways colocated MTC restore_infer dispatch: state_cpu_ids=%s.',
+  logging.vlog(
+      2,
+      'Pathways colocated MTC restore_infer state_cpu_ids=%s.',
       colocated_utils.value_sample(device.id for device in state_cpu_devices),
   )
-  result = _invoke_restore_call_with_retry(
-      restore_call, step_arr, partial_restore_arr
-  )
-  logging.info(
-      'Pathways colocated MTC restore_infer result ready elapsed=%.3fs.',
-      time.time() - restore_start,
-  )
+  with TimeBlock(
+      'Pathways colocated MTC restore_infer', level=python_logging.INFO
+  ) as timer:
+    result = _invoke_restore_call_with_retry(
+        restore_call, step_arr, partial_restore_arr
+    )
+    timer.append_data(
+        'restored_state_size',
+        colocated_utils.addressable_array_bytes(result),
+        'B',
+        log_rate=True,
+    )
   return result
 
 
@@ -487,8 +482,7 @@ def _invoke_restore_call_with_retry(
     jax.block_until_ready(result)
     return result
   except _RETRIABLE_COLOCATED_CALL_EXCEPTIONS as e:
-    logging.vlog(
-        1,
+    logging.info(
         'restore_infer dispatch failed (%s: %s); retrying once',
         type(e).__name__,
         e,
@@ -746,7 +740,8 @@ class ColocatedController:
     self._colocated_cpu_ids = frozenset(
         d.id for d in self._state_cpu_devices
     )
-    logging.info(
+    logging.vlog(
+        2,
         'Pathways colocated MTC controller topology: workers=%s, '
         'mesh_shape=%s, global_tpu_ids=%s, colocated_cpu_ids=%s, '
         'worker_cpu_ids=%s, distributed_to_cpu_ids=%s.',
@@ -810,23 +805,12 @@ class ColocatedController:
     while time.time() < deadline:
       attempt += 1
       try:
-        rpc_start = time.time()
-        logging.info(
-            'Pathways colocated MTC latest_step attempt=%d: dispatching '
-            'all_steps to worker_cpu_ids=%s.',
-            attempt,
-            colocated_utils.value_sample(
-                device.id for device in self._worker_cpu_devices
-            ),
-        )
-        result = self._worker_manager.all_steps(self._worker_dummy())
-        jax.block_until_ready(result)
-        logging.info(
-            'Pathways colocated MTC latest_step attempt=%d: all_steps ready '
-            'elapsed=%.3fs.',
-            attempt,
-            time.time() - rpc_start,
-        )
+        with TimeBlock(
+            f'Pathways colocated MTC latest_step attempt={attempt}',
+            level=_VLOG2_LEVEL,
+        ):
+          result = self._worker_manager.all_steps(self._worker_dummy())
+          jax.block_until_ready(result)
         worker_step_arrays = colocated_utils.array_result_values(
             result, op_name='all_steps'
         )
@@ -847,7 +831,7 @@ class ColocatedController:
         ]
         if not common_steps:
           logging.vlog(
-              1,
+              2,
               'Workers reported no common checkpoint steps: %s',
               [sorted(steps) for steps in worker_step_sets],
           )
@@ -865,7 +849,7 @@ class ColocatedController:
           )
         else:
           logging.vlog(
-              1,
+              2,
               'Pathways colocated MTC latest_step selected step=%d from '
               'worker_latest_steps=%s.',
               latest_common_step,
@@ -874,8 +858,7 @@ class ColocatedController:
         return latest_common_step
       except _RETRIABLE_COLOCATED_CALL_EXCEPTIONS as e:
         last_error = e
-        logging.vlog(
-            1,
+        logging.info(
             'latest_step transient failure on attempt=%s (%s), retrying...',
             attempt,
             e,
@@ -891,23 +874,12 @@ class ColocatedController:
     if step == colocated_utils.NO_STEP_SENTINEL:
       return False
     step_arr = _scalar_on_dummy(step, self._worker_dummy(), dtype=jnp.int32)
-    should_save_start = time.time()
-    logging.info(
-        'Pathways colocated MTC should_save step=%s: dispatching to '
-        'worker_cpu_ids=%s.',
-        step,
-        colocated_utils.value_sample(
-            device.id for device in self._worker_cpu_devices
-        ),
-    )
-    result = self._worker_manager.should_save(step_arr)
-    jax.block_until_ready(result)
-    logging.info(
-        'Pathways colocated MTC should_save step=%s: result ready '
-        'elapsed=%.3fs.',
-        step,
-        time.time() - should_save_start,
-    )
+    with TimeBlock(
+        f'Pathways colocated MTC should_save step={step}',
+        level=_VLOG2_LEVEL,
+    ):
+      result = self._worker_manager.should_save(step_arr)
+      jax.block_until_ready(result)
     value = colocated_utils.require_unanimous_scalar_result(
         result, op_name='should_save'
     )
@@ -944,16 +916,13 @@ class ColocatedController:
     """
     if step == colocated_utils.NO_STEP_SENTINEL:
       return False
-    save_start = time.time()
     if not force:
-      should_save_start = time.time()
       should_save = self.should_save(step)
       logging.vlog(
-          1,
-          'Pathways colocated MTC save step=%s: should_save=%s elapsed=%.3fs.',
+          2,
+          'Pathways colocated MTC save step=%s: should_save=%s.',
           step,
           should_save,
-          time.time() - should_save_start,
       )
       if not should_save:
         self._save_lifecycle.drain(wait=False)
@@ -962,58 +931,41 @@ class ColocatedController:
     dataset_args = self._persistent_dataset_args(args)
     self._validate_persistent_dataset_args(dataset_args)
 
-    pending_start = time.time()
-    had_pending_save = self._save_lifecycle.has_pending_save()
-    self._finish_pending_save()
-    if had_pending_save:
-      logging.info(
-          'Pathways colocated MTC save step=%s: prior async save finalized '
-          'elapsed=%.3fs.',
-          step,
-          time.time() - pending_start,
-      )
-    logging.info(
+    if self._save_lifecycle.has_pending_save():
+      with TimeBlock(
+          f'Pathways colocated MTC save step={step}: finalize prior save',
+          level=python_logging.INFO,
+      ):
+        self._finish_pending_save()
+    logging.vlog(
+        2,
         'Pathways colocated MTC save step=%s force=%s: begin.',
         step,
         force,
     )
-    prepare_start = time.time()
     state = self._prepare_state_for_save(step, args)
-    logging.vlog(
-        1,
-        'Pathways colocated MTC save step=%s: prepared state elapsed=%.3fs.',
-        step,
-        time.time() - prepare_start,
-    )
+    payload_bytes = colocated_utils.addressable_array_bytes(state)
     step_arr = _step_arr_on_state_devices(step, state)
     force_arr = jax.device_put(
         jnp.array(force, dtype=jnp.bool_), step_arr.sharding
     )
-    specialize_start = time.time()
-    save_call = self._get_worker_save_call(step_arr, force_arr, state)
-    logging.vlog(
-        1,
-        'Pathways colocated MTC save step=%s: worker save call ready '
-        'elapsed=%.3fs.',
-        step,
-        time.time() - specialize_start,
-    )
-    dispatch_start = time.time()
-    result = save_call(step_arr, force_arr, state)
-    logging.vlog(
-        1,
-        'Pathways colocated MTC save step=%s: save_call returned '
-        'elapsed=%.3fs.',
-        step,
-        time.time() - dispatch_start,
-    )
+    with TimeBlock(
+        f'Pathways colocated MTC save step={step}: specialize worker call',
+        level=_VLOG2_LEVEL,
+    ):
+      save_call = self._get_worker_save_call(step_arr, force_arr, state)
+    with TimeBlock(
+        f'Pathways colocated MTC save step={step}: dispatch worker call',
+        level=python_logging.INFO,
+    ):
+      result = save_call(step_arr, force_arr, state)
     pending_save = _PendingSave(
         step=step,
         force=force,
         result=result,
         keepalive=(step_arr, force_arr, state),
         dataset_args=dataset_args,
-        start_time=save_start,
+        payload_bytes=payload_bytes,
     )
     self._start_pending_save_handoff_drain(pending_save)
     if not self._enable_async_checkpointing:
@@ -1024,10 +976,8 @@ class ColocatedController:
       )
       return bool(self._finish_pending_save())
     logging.info(
-        'Pathways colocated MTC save step=%s: dispatched async save '
-        'total_elapsed=%.3fs.',
+        'Pathways colocated MTC save step=%s: dispatched async save.',
         step,
-        time.time() - save_start,
     )
     return True
 
@@ -1039,7 +989,6 @@ class ColocatedController:
       default_item_mode: bool,
   ) -> Any:
     """Restores state and remaps worker-local shardings back to caller specs."""
-    restore_start = time.time()
     state_restore_args = args[_STATE_ITEM_NAME]
     if not isinstance(state_restore_args, args_lib.PyTreeRestore):
       raise ValueError(
@@ -1080,7 +1029,6 @@ class ColocatedController:
           'Pathways colocated MTC cannot restore step 0 because the MTC '
           'coordinator protocol reserves step 0 as "no checkpoint".'
       )
-    resolved_step_elapsed = time.time() - restore_start
 
     target_shardings = _prepare_restore_target_shardings(state_restore_args)
     transport_target_shardings = _serialize_for_colocated_transport(
@@ -1147,34 +1095,28 @@ class ColocatedController:
         state,
         final_target_shardings,
     )
-    final_transfer_start = time.time()
-    logging.info(
-        'Pathways colocated MTC restore step=%s: transferring restored state '
-        'to final target shardings.',
-        resolved_step,
-    )
-    state = colocated_transport.to_final_specs(state, target_specs)
-    jax.block_until_ready(state)
-    logging.info(
-        'Pathways colocated MTC restore step=%s: final target shardings ready '
-        'elapsed=%.3fs.',
-        resolved_step,
-        time.time() - final_transfer_start,
-    )
+    with TimeBlock(
+        f'Pathways colocated MTC restore step={resolved_step}: '
+        'transfer to final shardings',
+        level=python_logging.INFO,
+    ) as timer:
+      state = colocated_transport.to_final_specs(state, target_specs)
+      jax.block_until_ready(state)
+      timer.append_data(
+          'restored_state_size',
+          colocated_utils.addressable_array_bytes(state),
+          'B',
+          log_rate=True,
+      )
     restored = self._finalize_restore_result(
         step=resolved_step,
         args=args,
         state=state,
         default_item_mode=default_item_mode,
     )
-    total_elapsed = time.time() - restore_start
-    after_step_resolution_elapsed = total_elapsed - resolved_step_elapsed
     logging.info(
-        'Pathways colocated MTC restore step=%s: controller restore complete '
-        'total_elapsed=%.3fs after_step_resolution_elapsed=%.3fs.',
+        'Pathways colocated MTC restore step=%s: controller restore complete.',
         resolved_step,
-        total_elapsed,
-        after_step_resolution_elapsed,
     )
     return restored
 
@@ -1206,21 +1148,12 @@ class ColocatedController:
 
   def _worker_wait_until_finished(self) -> None:
     """Waits for worker-side checkpoint manager operations to finish."""
-    wait_start = time.time()
-    logging.info(
-        'Pathways colocated MTC wait_until_finished: dispatching to '
-        'worker_cpu_ids=%s.',
-        colocated_utils.value_sample(
-            device.id for device in self._worker_cpu_devices
-        ),
-    )
-    result = self._worker_manager.wait_until_finished(self._worker_dummy())
-    jax.block_until_ready(result)
-    logging.info(
-        'Pathways colocated MTC wait_until_finished: worker result ready '
-        'elapsed=%.3fs.',
-        time.time() - wait_start,
-    )
+    with TimeBlock(
+        'Pathways colocated MTC wait_until_finished',
+        level=python_logging.INFO,
+    ):
+      result = self._worker_manager.wait_until_finished(self._worker_dummy())
+      jax.block_until_ready(result)
 
   def _worker_is_saving_in_progress(self) -> bool:
     """Returns whether worker-side checkpoint manager is saving."""
@@ -1394,38 +1327,31 @@ class ColocatedController:
           step,
           _array_tree_summary(state_save_args.item),
       )
-    serialize_start = time.time()
-    state = _serialize_for_colocated_transport(state_save_args.item)
-    logging.info(
-        'Pathways colocated MTC save step=%s: serialized state structure '
-        'elapsed=%.3fs.',
-        step,
-        time.time() - serialize_start,
-    )
-    transport_start = time.time()
-    state = colocated_transport.to_colocated_python(state)
-    logging.info(
-        'Pathways colocated MTC save step=%s: to_colocated_python returned '
-        'elapsed=%.3fs.',
-        step,
-        time.time() - transport_start,
-    )
-    validate_start = time.time()
-    colocated_utils.assert_arrays_on_platform(
-        state,
-        expected_platform='cpu',
-        tree_name='state_for_colocated_save',
-    )
-    colocated_utils.assert_arrays_on_allowed_cpu_ids(
-        state,
-        allowed_ids=self._colocated_cpu_ids,
-        tree_name='state_for_colocated_save',
-    )
-    logging.info(
-        'Pathways colocated MTC save step=%s: state validation elapsed=%.3fs.',
-        step,
-        time.time() - validate_start,
-    )
+    with TimeBlock(
+        f'Pathways colocated MTC save step={step}: serialize state structure',
+        level=_VLOG2_LEVEL,
+    ):
+      state = _serialize_for_colocated_transport(state_save_args.item)
+    with TimeBlock(
+        f'Pathways colocated MTC save step={step}: transfer to colocated'
+        ' Python',
+        level=python_logging.INFO,
+    ):
+      state = colocated_transport.to_colocated_python(state)
+    with TimeBlock(
+        f'Pathways colocated MTC save step={step}: validate colocated state',
+        level=_VLOG2_LEVEL,
+    ):
+      colocated_utils.assert_arrays_on_platform(
+          state,
+          expected_platform='cpu',
+          tree_name='state_for_colocated_save',
+      )
+      colocated_utils.assert_arrays_on_allowed_cpu_ids(
+          state,
+          allowed_ids=self._colocated_cpu_ids,
+          tree_name='state_for_colocated_save',
+      )
     return state
 
   def _rebuild_restored_state(

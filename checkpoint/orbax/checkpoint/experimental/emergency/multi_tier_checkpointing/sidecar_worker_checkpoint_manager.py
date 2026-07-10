@@ -16,7 +16,7 @@
 import collections
 from collections.abc import Mapping
 import itertools
-import time
+import logging as python_logging
 from typing import Any
 
 from absl import logging
@@ -31,6 +31,9 @@ from orbax.checkpoint._src.multihost import colocated_transport
 from orbax.checkpoint.experimental.emergency.multi_tier_checkpointing import colocated_utils
 from orbax.checkpoint.experimental.emergency.multi_tier_checkpointing import pathways_topology
 from orbax.checkpoint.experimental.emergency.multi_tier_checkpointing import replicator_checkpoint_manager as rcm_lib
+from orbax.checkpoint.experimental.emergency.multi_tier_checkpointing.time_block import (
+    TimeBlock,
+)
 
 
 PyTree = Any
@@ -169,7 +172,8 @@ class WorkerCheckpointManagerRaw:
     )
     self._enable_async_checkpointing = enable_async_checkpointing
     self._save_concurrent_gb = save_concurrent_gb
-    logging.info(
+    logging.vlog(
+        2,
         'Pathways colocated MTC sidecar initialized: local_directory=%s, '
         'async_checkpointing=%s, save_concurrent_gb=%s, '
         'restore_concurrent_gb=%s, mesh_shape=%s, '
@@ -206,17 +210,7 @@ class WorkerCheckpointManagerRaw:
     Returns:
       A scalar JAX array containing True if a step was saved.
     """
-    save_start = time.time()
-    logging.info(
-        'Pathways colocated MTC sidecar save step=<unknown>: entered worker '
-        'save function.'
-    )
     step = int(np.asarray(step_array))
-    logging.info(
-        'Pathways colocated MTC sidecar save step=%s: resolved worker save '
-        'step.',
-        step,
-    )
     if step == colocated_utils.NO_STEP_SENTINEL:
       return colocated_utils.make_scalar_on_like(
           False, step_array, dtype=jnp.bool_
@@ -225,25 +219,28 @@ class WorkerCheckpointManagerRaw:
     save_args = args_lib.Composite(
         state=args_lib.PyTreeSave(state),
     )
-    local_save_start = time.time()
-    saved = self._rcm.save(step, args=save_args, force=force)
-    logging.info(
-        'Pathways colocated MTC sidecar save step=%s: local RCM save returned '
-        'saved=%s elapsed=%.3fs async_checkpointing=%s '
-        'save_concurrent_gb=%s.',
-        step,
-        saved,
-        time.time() - local_save_start,
-        self._enable_async_checkpointing,
-        self._save_concurrent_gb,
+    save_concurrent_bytes = (
+        self._save_concurrent_gb * 10**9
+        if self._save_concurrent_gb is not None
+        else None
     )
-    logging.info(
-        'Pathways colocated MTC sidecar save step=%s force=%s: finished worker '
-        'save function total_elapsed=%.3fs.',
-        step,
-        force,
-        time.time() - save_start,
-    )
+    with TimeBlock(
+        f'Pathways colocated MTC sidecar save step={step} force={force}',
+        level=python_logging.INFO,
+    ) as timer:
+      saved = self._rcm.save(step, args=save_args, force=force)
+      timer.append_data('saved', str(saved))
+      timer.append_data(
+          'async_checkpointing', str(self._enable_async_checkpointing)
+      )
+      timer.append_data('save_concurrent_gb', save_concurrent_bytes, 'B')
+      if saved:
+        timer.append_data(
+            'checkpoint_size',
+            colocated_utils.addressable_array_bytes(state),
+            'B',
+            log_rate=True,
+        )
     # The controller uses this result as a payload-handoff acknowledgement.
     # The local RCM `saved` value is logged above, but is not a global
     # controller contract because sidecars can report local no-ops.
@@ -284,28 +281,25 @@ class WorkerCheckpointManagerRaw:
           'Pathways colocated MTC cannot restore step 0 because the MTC '
           'coordinator protocol reserves step 0 as "no checkpoint".'
       )
-    logging.vlog(
-        1,
-        'Pathways colocated MTC sidecar restore step=%s partial_restore=%s: '
-        'entered worker restore function.',
-        step,
-        partial_restore,
-    )
-    restore_start = time.time()
-    result = self._rcm.restore(
-        None if step < 0 else step,
-        args_lib.Composite(
-            state=args_lib.PyTreeRestore(partial_restore=partial_restore),
-        ),
-    )
-    logging.info(
-        'Pathways colocated MTC sidecar restore step=%s partial_restore=%s: '
-        'local restore returned elapsed=%.3fs.',
-        step,
-        partial_restore,
-        time.time() - restore_start,
-    )
-    return _unwrap_restored_state(result)
+    with TimeBlock(
+        f'Pathways colocated MTC sidecar restore step={step} '
+        f'partial_restore={partial_restore}',
+        level=python_logging.INFO,
+    ) as timer:
+      result = self._rcm.restore(
+          None if step < 0 else step,
+          args_lib.Composite(
+              state=args_lib.PyTreeRestore(partial_restore=partial_restore),
+          ),
+      )
+      restored_state = _unwrap_restored_state(result)
+      timer.append_data(
+          'checkpoint_size',
+          colocated_utils.addressable_array_bytes(restored_state),
+          'B',
+          log_rate=True,
+      )
+    return restored_state
 
   def latest_step(self, dummy_array: jax.Array) -> jax.Array:
     """Returns latest_step_or_sentinel as a scalar int32."""
@@ -338,13 +332,11 @@ class WorkerCheckpointManagerRaw:
 
   def wait_until_finished(self, dummy_array: jax.Array) -> jax.Array:
     """Blocks until worker-side async save work completes."""
-    wait_start = time.time()
-    self._rcm.wait_until_finished()
-    logging.info(
-        'Pathways colocated MTC sidecar async save finalizer wait complete '
-        'elapsed=%.3fs.',
-        time.time() - wait_start,
-    )
+    with TimeBlock(
+        'Pathways colocated MTC sidecar wait for async save finalization',
+        level=python_logging.INFO,
+    ):
+      self._rcm.wait_until_finished()
     return colocated_utils.make_scalar_on_like(
         True, dummy_array, dtype=jnp.bool_
     )
