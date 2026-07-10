@@ -461,9 +461,19 @@ def _call_worker_restore_infer(
       in_specs=in_specs,
       devices=state_cpu_devices,
   )
-  return _invoke_restore_call_with_retry(
+  restore_start = time.time()
+  logging.info(
+      'Pathways colocated MTC restore_infer dispatch: state_cpu_ids=%s.',
+      colocated_utils.value_sample(device.id for device in state_cpu_devices),
+  )
+  result = _invoke_restore_call_with_retry(
       restore_call, step_arr, partial_restore_arr
   )
+  logging.info(
+      'Pathways colocated MTC restore_infer result ready elapsed=%.3fs.',
+      time.time() - restore_start,
+  )
+  return result
 
 
 def _invoke_restore_call_with_retry(
@@ -751,7 +761,6 @@ class ColocatedController:
         ),
         colocated_utils.nested_id_sample(distributed_to_cpu_device_ids),
     )
-    self._dummy = dispatchers.get_dummy_input_array(self._worker_cpu_devices)
     self._specialize_worker_calls()
 
     self._persistent_checkpoint_manager = None
@@ -789,6 +798,10 @@ class ColocatedController:
   def _pending_save(self, pending_save: _PendingSave | None) -> None:
     self._save_lifecycle.pending_save = pending_save
 
+  def _worker_dummy(self) -> jax.Array:
+    """Returns a fresh dummy input array for worker-management RPCs."""
+    return dispatchers.get_dummy_input_array(self._worker_cpu_devices)
+
   def latest_step(self) -> int | None:
     """Returns the highest step present on every worker, or `None`."""
     attempt = 0
@@ -797,8 +810,23 @@ class ColocatedController:
     while time.time() < deadline:
       attempt += 1
       try:
-        result = self._worker_manager.all_steps(self._dummy)
+        rpc_start = time.time()
+        logging.info(
+            'Pathways colocated MTC latest_step attempt=%d: dispatching '
+            'all_steps to worker_cpu_ids=%s.',
+            attempt,
+            colocated_utils.value_sample(
+                device.id for device in self._worker_cpu_devices
+            ),
+        )
+        result = self._worker_manager.all_steps(self._worker_dummy())
         jax.block_until_ready(result)
+        logging.info(
+            'Pathways colocated MTC latest_step attempt=%d: all_steps ready '
+            'elapsed=%.3fs.',
+            attempt,
+            time.time() - rpc_start,
+        )
         worker_step_arrays = colocated_utils.array_result_values(
             result, op_name='all_steps'
         )
@@ -814,6 +842,9 @@ class ColocatedController:
           })
 
         common_steps = set.intersection(*worker_step_sets)
+        worker_latest_steps = [
+            max(steps) if steps else None for steps in worker_step_sets
+        ]
         if not common_steps:
           logging.vlog(
               1,
@@ -821,7 +852,26 @@ class ColocatedController:
               [sorted(steps) for steps in worker_step_sets],
           )
           return None
-        return max(common_steps)
+        latest_common_step = max(common_steps)
+        max_worker_step = max(
+            step for step in worker_latest_steps if step is not None
+        )
+        if latest_common_step < max_worker_step:
+          logging.info(
+              'Pathways colocated MTC latest_step selected lower common '
+              'step=%d while worker_latest_steps=%s.',
+              latest_common_step,
+              worker_latest_steps,
+          )
+        else:
+          logging.vlog(
+              1,
+              'Pathways colocated MTC latest_step selected step=%d from '
+              'worker_latest_steps=%s.',
+              latest_common_step,
+              worker_latest_steps,
+          )
+        return latest_common_step
       except _RETRIABLE_COLOCATED_CALL_EXCEPTIONS as e:
         last_error = e
         logging.vlog(
@@ -840,9 +890,24 @@ class ColocatedController:
     """Returns whether workers want to save `step`."""
     if step == colocated_utils.NO_STEP_SENTINEL:
       return False
-    step_arr = _scalar_on_dummy(step, self._dummy, dtype=jnp.int32)
+    step_arr = _scalar_on_dummy(step, self._worker_dummy(), dtype=jnp.int32)
+    should_save_start = time.time()
+    logging.info(
+        'Pathways colocated MTC should_save step=%s: dispatching to '
+        'worker_cpu_ids=%s.',
+        step,
+        colocated_utils.value_sample(
+            device.id for device in self._worker_cpu_devices
+        ),
+    )
     result = self._worker_manager.should_save(step_arr)
     jax.block_until_ready(result)
+    logging.info(
+        'Pathways colocated MTC should_save step=%s: result ready '
+        'elapsed=%.3fs.',
+        step,
+        time.time() - should_save_start,
+    )
     value = colocated_utils.require_unanimous_scalar_result(
         result, op_name='should_save'
     )
@@ -974,6 +1039,7 @@ class ColocatedController:
       default_item_mode: bool,
   ) -> Any:
     """Restores state and remaps worker-local shardings back to caller specs."""
+    restore_start = time.time()
     state_restore_args = args[_STATE_ITEM_NAME]
     if not isinstance(state_restore_args, args_lib.PyTreeRestore):
       raise ValueError(
@@ -1014,6 +1080,7 @@ class ColocatedController:
           'Pathways colocated MTC cannot restore step 0 because the MTC '
           'coordinator protocol reserves step 0 as "no checkpoint".'
       )
+    resolved_step_elapsed = time.time() - restore_start
 
     target_shardings = _prepare_restore_target_shardings(state_restore_args)
     transport_target_shardings = _serialize_for_colocated_transport(
@@ -1094,12 +1161,22 @@ class ColocatedController:
         resolved_step,
         time.time() - final_transfer_start,
     )
-    return self._finalize_restore_result(
+    restored = self._finalize_restore_result(
         step=resolved_step,
         args=args,
         state=state,
         default_item_mode=default_item_mode,
     )
+    total_elapsed = time.time() - restore_start
+    after_step_resolution_elapsed = total_elapsed - resolved_step_elapsed
+    logging.info(
+        'Pathways colocated MTC restore step=%s: controller restore complete '
+        'total_elapsed=%.3fs after_step_resolution_elapsed=%.3fs.',
+        resolved_step,
+        total_elapsed,
+        after_step_resolution_elapsed,
+    )
+    return restored
 
   def wait_until_finished(self) -> None:
     """Blocks until persistent and worker-side async save work finishes."""
@@ -1129,12 +1206,25 @@ class ColocatedController:
 
   def _worker_wait_until_finished(self) -> None:
     """Waits for worker-side checkpoint manager operations to finish."""
-    result = self._worker_manager.wait_until_finished(self._dummy)
+    wait_start = time.time()
+    logging.info(
+        'Pathways colocated MTC wait_until_finished: dispatching to '
+        'worker_cpu_ids=%s.',
+        colocated_utils.value_sample(
+            device.id for device in self._worker_cpu_devices
+        ),
+    )
+    result = self._worker_manager.wait_until_finished(self._worker_dummy())
     jax.block_until_ready(result)
+    logging.info(
+        'Pathways colocated MTC wait_until_finished: worker result ready '
+        'elapsed=%.3fs.',
+        time.time() - wait_start,
+    )
 
   def _worker_is_saving_in_progress(self) -> bool:
     """Returns whether worker-side checkpoint manager is saving."""
-    result = self._worker_manager.is_saving_in_progress(self._dummy)
+    result = self._worker_manager.is_saving_in_progress(self._worker_dummy())
     jax.block_until_ready(result)
     values = colocated_utils.scalar_result_values(
         result, op_name='is_saving_in_progress'
@@ -1150,11 +1240,11 @@ class ColocatedController:
     return any(values)
 
   def _worker_check_for_errors(self) -> None:
-    result = self._worker_manager.check_for_errors(self._dummy)
+    result = self._worker_manager.check_for_errors(self._worker_dummy())
     jax.block_until_ready(result)
 
   def _worker_close(self) -> None:
-    result = self._worker_manager.close(self._dummy)
+    result = self._worker_manager.close(self._worker_dummy())
     jax.block_until_ready(result)
 
   def _specialize_worker_calls(self) -> None:

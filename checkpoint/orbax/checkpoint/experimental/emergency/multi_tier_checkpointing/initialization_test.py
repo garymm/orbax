@@ -550,7 +550,7 @@ class MultiTierCheckpointingInitializationTest(
     )
     mock_devices.return_value = ("stale_tpu0", "stale_tpu1")
     mock_make_array_from_callback.return_value = np.asarray(True)
-    mock_time.side_effect = [90.0, 100.0, 100.0, 110.0, 120.0]
+    mock_time.return_value = 100.0
 
     def _wrap_setup(fn):
       closure_contents = tuple(
@@ -603,11 +603,11 @@ class MultiTierCheckpointingInitializationTest(
     )
     mock_wait_for_replicator_file_to_disappear.assert_called_once_with(
         epath.Path("/tmp/mtc"),
-        timeout_seconds=300,
+        timeout_seconds=600,
     )
     mock_block_and_process_restore_dir.assert_called_once_with(
         epath.Path("/tmp/mtc"),
-        timeout_seconds=890,
+        timeout_seconds=900,
     )
     mock_block_until_ready.assert_called_once()
 

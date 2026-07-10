@@ -84,7 +84,6 @@ class ColocatedControllerInternalTest(parameterized.TestCase):
     worker_manager = mock.Mock(
         spec=sidecar_worker_checkpoint_manager.WorkerCheckpointManager
     )
-    dummy = object()
     worker_cpu_devices = (mock.Mock(spec=jax.Device, id=101),)
     state_cpu_devices = (
         mock.Mock(spec=jax.Device, id=101),
@@ -123,11 +122,7 @@ class ColocatedControllerInternalTest(parameterized.TestCase):
         )
     )
     mock_get_dummy_input_array = self.enter_context(
-        mock.patch.object(
-            controller_lib.dispatchers,
-            'get_dummy_input_array',
-            return_value=dummy,
-        )
+        mock.patch.object(controller_lib.dispatchers, 'get_dummy_input_array')
     )
     self.enter_context(
         mock.patch.object(
@@ -136,7 +131,7 @@ class ColocatedControllerInternalTest(parameterized.TestCase):
             autospec=True,
         )
     )
-    controller = controller_lib.ColocatedController(
+    _ = controller_lib.ColocatedController(
         local_directory=mock.Mock(spec=epath.Path),
         global_mesh=fake_mesh,
         options=_options(),
@@ -145,7 +140,6 @@ class ColocatedControllerInternalTest(parameterized.TestCase):
         checkpoint_manager_options_fn=mock.Mock(),
     )
 
-    self.assertIs(controller._dummy, dummy)
     mock_install_patch.assert_called_once_with()
     mock_topology_from_devices.assert_called_once_with(
         (fake_device_2, fake_device_1)
@@ -156,7 +150,7 @@ class ColocatedControllerInternalTest(parameterized.TestCase):
         (state_cpu_devices[0], state_cpu_devices[1]),
     )
     topology.worker_cpu_devices.assert_called_once_with()
-    mock_get_dummy_input_array.assert_called_once_with(worker_cpu_devices)
+    mock_get_dummy_input_array.assert_not_called()
     mock_worker_manager.assert_called_once_with(
         local_directory=mock.ANY,
         mesh_shape=(2,),
@@ -169,6 +163,25 @@ class ColocatedControllerInternalTest(parameterized.TestCase):
         save_concurrent_gb=None,
         restore_concurrent_gb=None,
     )
+
+  def test_worker_dummy_returns_fresh_array(self):
+    controller, _ = self._make_controller_for_restore()
+    dummy1 = object()
+    dummy2 = object()
+
+    with mock.patch.object(
+        controller_lib.dispatchers,
+        'get_dummy_input_array',
+        side_effect=[dummy1, dummy2],
+    ) as mock_get_dummy_input_array:
+      self.assertIs(controller._worker_dummy(), dummy1)
+      self.assertIs(controller._worker_dummy(), dummy2)
+
+    self.assertEqual(mock_get_dummy_input_array.call_count, 2)
+    mock_get_dummy_input_array.assert_has_calls([
+        mock.call(controller._worker_cpu_devices),
+        mock.call(controller._worker_cpu_devices),
+    ])
 
   def test_init_rejects_empty_colocated_cpu_devices(self):
     fake_mesh = mock.create_autospec(jax.sharding.Mesh, instance=True)
@@ -275,9 +288,6 @@ class ColocatedControllerInternalTest(parameterized.TestCase):
 
   def _make_controller_for_restore(self):
     controller, device = self._make_controller_for_specialization()
-    controller._dummy = jax.device_put(
-        jnp.array(True), jax.sharding.SingleDeviceSharding(device)
-    )
     controller._persistent_checkpoint_manager = None
     mesh = jax.sharding.Mesh(np.array([device]), ('d',))
     sharding = jax.sharding.NamedSharding(mesh, jax.sharding.PartitionSpec())
@@ -553,6 +563,8 @@ class ColocatedControllerInternalTest(parameterized.TestCase):
   def test_latest_step_retries_transient_runtime_error(self):
     controller, _ = self._make_controller_for_restore()
     controller._worker_manager = mock.Mock()
+    dummy1 = object()
+    dummy2 = object()
     controller._worker_manager.all_steps.side_effect = [
         RuntimeError('transient'),
         object(),
@@ -562,29 +574,45 @@ class ColocatedControllerInternalTest(parameterized.TestCase):
         controller_lib.colocated_utils,
         'array_result_values',
         return_value=[_steps_array([12])],
-    ), mock.patch.object(controller_lib.time, 'sleep') as mock_sleep:
+    ), mock.patch.object(
+        controller, '_worker_dummy', side_effect=[dummy1, dummy2]
+    ) as mock_worker_dummy, mock.patch.object(
+        controller_lib.time, 'sleep'
+    ) as mock_sleep:
       latest_step = controller.latest_step()
 
     self.assertEqual(latest_step, 12)
     self.assertEqual(controller._worker_manager.all_steps.call_count, 2)
+    controller._worker_manager.all_steps.assert_has_calls([
+        mock.call(dummy1),
+        mock.call(dummy2),
+    ])
+    self.assertEqual(mock_worker_dummy.call_count, 2)
     mock_sleep.assert_called_once_with(1)
 
   def test_should_save_returns_worker_vote(self):
     controller, _ = self._make_controller_for_restore()
     controller._worker_manager = mock.Mock()
     controller._worker_manager.should_save.return_value = object()
+    dummy = jax.device_put(
+        jnp.array(True),
+        jax.sharding.SingleDeviceSharding(controller._worker_cpu_devices[0]),
+    )
 
     with mock.patch.object(
         controller_lib.colocated_utils,
         'require_unanimous_scalar_result',
         return_value=True,
-    ) as mock_unanimous:
+    ) as mock_unanimous, mock.patch.object(
+        controller, '_worker_dummy', return_value=dummy
+    ) as mock_worker_dummy:
       should_save = controller.should_save(9)
 
     self.assertTrue(should_save)
     controller._worker_manager.should_save.assert_called_once()
     step_arg = controller._worker_manager.should_save.call_args.args[0]
     self.assertEqual(np.asarray(step_arg).item(), 9)
+    mock_worker_dummy.assert_called_once_with()
     mock_unanimous.assert_called_once()
 
   def test_should_save_skips_protocol_no_checkpoint_sentinel(self):
@@ -1522,19 +1550,23 @@ class ColocatedControllerInternalTest(parameterized.TestCase):
     controller, _ = self._make_controller_for_restore()
     controller._worker_manager = mock.Mock()
     result = object()
+    dummy = object()
     controller._worker_manager.is_saving_in_progress.return_value = result
 
     with mock.patch.object(
         controller_lib.colocated_utils,
         'scalar_result_values',
         return_value=[False, False],
-    ) as mock_values:
+    ) as mock_values, mock.patch.object(
+        controller, '_worker_dummy', return_value=dummy
+    ) as mock_worker_dummy:
       in_progress = controller.is_saving_in_progress()
 
     self.assertFalse(in_progress)
     controller._worker_manager.is_saving_in_progress.assert_called_once_with(
-        controller._dummy
+        dummy
     )
+    mock_worker_dummy.assert_called_once_with()
     mock_values.assert_called_once_with(
         result, op_name='is_saving_in_progress'
     )
@@ -1634,33 +1666,41 @@ class ColocatedControllerInternalTest(parameterized.TestCase):
   def test_wait_until_finished_blocks_on_worker_result(self):
     controller, _ = self._make_controller_for_restore()
     worker_result = object()
+    dummy = object()
     controller._worker_manager = mock.Mock()
     controller._worker_manager.wait_until_finished.return_value = worker_result
 
     with mock.patch.object(
         controller_lib.jax, 'block_until_ready'
-    ) as mock_block:
+    ) as mock_block, mock.patch.object(
+        controller, '_worker_dummy', return_value=dummy
+    ) as mock_worker_dummy:
       controller.wait_until_finished()
 
     controller._worker_manager.wait_until_finished.assert_called_once_with(
-        controller._dummy
+        dummy
     )
+    mock_worker_dummy.assert_called_once_with()
     mock_block.assert_called_once_with(worker_result)
 
   def test_close_shuts_down_persistent_and_worker_managers(self):
     controller, _ = self._make_controller_for_restore()
     worker_result = object()
+    dummy = object()
     controller._worker_manager = mock.Mock()
     controller._worker_manager.close.return_value = worker_result
     controller._persistent_checkpoint_manager = mock.Mock()
 
     with mock.patch.object(
         controller_lib.jax, 'block_until_ready'
-    ) as mock_block:
+    ) as mock_block, mock.patch.object(
+        controller, '_worker_dummy', return_value=dummy
+    ) as mock_worker_dummy:
       controller.close()
 
     controller._persistent_checkpoint_manager.close.assert_called_once_with()
-    controller._worker_manager.close.assert_called_once_with(controller._dummy)
+    controller._worker_manager.close.assert_called_once_with(dummy)
+    mock_worker_dummy.assert_called_once_with()
     mock_block.assert_called_once_with(worker_result)
 
   def test_restore_uses_worker_restore_infer_and_reshards(self):

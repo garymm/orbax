@@ -291,11 +291,19 @@ class WorkerCheckpointManagerRaw:
         step,
         partial_restore,
     )
+    restore_start = time.time()
     result = self._rcm.restore(
         None if step < 0 else step,
         args_lib.Composite(
             state=args_lib.PyTreeRestore(partial_restore=partial_restore),
         ),
+    )
+    logging.info(
+        'Pathways colocated MTC sidecar restore step=%s partial_restore=%s: '
+        'local restore returned elapsed=%.3fs.',
+        step,
+        partial_restore,
+        time.time() - restore_start,
     )
     return _unwrap_restored_state(result)
 

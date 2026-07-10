@@ -31,6 +31,9 @@ from orbax.checkpoint._src.multihost import dispatchers
 from orbax.checkpoint._src.multihost import multihost
 from orbax.checkpoint._src.multihost import multislice
 from orbax.checkpoint.experimental.emergency.multi_tier_checkpointing import (
+    colocated_utils,
+)
+from orbax.checkpoint.experimental.emergency.multi_tier_checkpointing import (
     pathways_topology,
 )
 
@@ -39,7 +42,7 @@ _REPLICATOR_FILE = 'replicator.yaml'
 _TEMP_REPLICATOR_FILE_NAME = _REPLICATOR_FILE + '.tmp'
 _JAX_INIT_INFO_FILE = 'jax-init-info.txt'
 _RESTORE_DIR_RE = re.compile(r'^.+-s(?P<step>\d+)-n\d+-w\d+\.restore$')
-_PATHWAYS_REPLICATOR_FILE_TIMEOUT_SECONDS = 300
+_PATHWAYS_REPLICATOR_FILE_TIMEOUT_SECONDS = 600
 
 
 def _wait_for_replicator_file_to_disappear(
@@ -196,6 +199,17 @@ def _initialize_mtc_colocated(
       'from %d JAX devices.',
       len(worker_cpu_devices),
       len(all_devices),
+  )
+  logging.info(
+      'Pathways MTC initialization topology: num_nodes=%d, num_slices=%d, '
+      'data_parallelism=%d, worker_cpu_ids=%s, worker_tpu_ids=%s, '
+      'peer_ranks=%s.',
+      num_nodes,
+      num_slices,
+      data_parallelism,
+      colocated_utils.value_sample(worker_cpu_device_ids),
+      colocated_utils.nested_id_sample(worker_tpu_device_ids),
+      colocated_utils.nested_id_sample(peer_ranks_by_worker_rank),
   )
 
   dummy_in = dispatchers.get_dummy_input_array(worker_cpu_devices)
