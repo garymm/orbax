@@ -14,6 +14,7 @@
 
 """AsyncCheckpointer."""
 
+import dataclasses
 import datetime
 import sys
 import threading
