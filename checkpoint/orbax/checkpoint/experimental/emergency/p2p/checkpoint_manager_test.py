@@ -154,7 +154,7 @@ class CheckpointManagerTest(absltest.TestCase):
     args = p2p_args_lib.Composite(state={'a': 1})
     manager.save(1, args=args)
     self.local_manager_instance.save.assert_called_once_with(
-        1, args=args, force=False
+        1, args=args, force=False, custom_metadata=None
     )
     self.persistent_manager_instance.save.assert_not_called()
     manager.close()
@@ -172,10 +172,31 @@ class CheckpointManagerTest(absltest.TestCase):
     args = p2p_args_lib.Composite(state={'a': 1})
     manager.save(1, args=args)
     self.local_manager_instance.save.assert_called_once_with(
-        1, args=args, force=False
+        1, args=args, force=False, custom_metadata=None
     )
     self.persistent_manager_instance.save.assert_called_once_with(
-        1, args=args, force=False
+        1, args=args, force=False, custom_metadata=None
+    )
+    manager.close()
+
+  @mock.patch.object(multihost, 'process_index', return_value=0)
+  def test_save_with_custom_metadata(self, _):
+    self.local_manager_instance.scan_stored_steps.return_value = (0, [])
+    self.mock_sync_global_data.return_value = []
+    manager = p2p_cm.CheckpointManager(
+        self.mesh,
+        self.abstract_state,
+        self.local_dir,
+        persistent_directory=self.persistent_dir,
+    )
+    args = p2p_args_lib.Composite(state={'a': 1})
+    custom_metadata = {'lora_rank': 8, 'lora_alpha': 16}
+    manager.save(1, args=args, custom_metadata=custom_metadata)
+    self.local_manager_instance.save.assert_called_once_with(
+        1, args=args, force=False, custom_metadata=custom_metadata
+    )
+    self.persistent_manager_instance.save.assert_called_once_with(
+        1, args=args, force=False, custom_metadata=custom_metadata
     )
     manager.close()
 

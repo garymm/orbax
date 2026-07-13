@@ -147,6 +147,7 @@ class _PendingSave:
   handoff_saved: bool | None = None
   handoff_error: BaseException | None = None
   saved: bool | None = None
+  custom_metadata: dict[str, Any] | None = None
   drain_lock: threading.Lock = dataclasses.field(
       default_factory=threading.Lock, init=False, repr=False
   )
@@ -294,6 +295,7 @@ class _ControllerSaveHandoffLifecycle:
             pending_save.step,
             pending_save.dataset_args,
             force=pending_save.force,
+            custom_metadata=pending_save.custom_metadata,
         )
       with self._lock:
         pending_save.saved = saved
@@ -903,6 +905,7 @@ class ColocatedController:
       args: args_lib.Composite,
       *,
       force: bool = False,
+      custom_metadata: dict[str, Any] | None = None,
   ) -> bool:
     """Saves state and returns whether a new save occurred.
 
@@ -910,6 +913,7 @@ class ColocatedController:
       step: The current training step.
       args: Replicator arguments for saving.
       force: If True, bypasses the normal save schedule.
+      custom_metadata: Optional dictionary of custom metadata.
 
     Returns:
       True if the step was dispatched for saving, False otherwise.
@@ -966,6 +970,7 @@ class ColocatedController:
         keepalive=(step_arr, force_arr, state),
         dataset_args=dataset_args,
         payload_bytes=payload_bytes,
+        custom_metadata=custom_metadata,
     )
     self._start_pending_save_handoff_drain(pending_save)
     if not self._enable_async_checkpointing:
@@ -1271,6 +1276,7 @@ class ColocatedController:
       dataset_args: args_lib.Composite | None,
       *,
       force: bool,
+      custom_metadata: dict[str, Any] | None = None,
   ) -> None:
     """Saves persistent dataset if present in args."""
     if dataset_args is None:
@@ -1281,6 +1287,7 @@ class ColocatedController:
         step,
         args=dataset_args,
         force=force,
+        custom_metadata=custom_metadata,
     )
 
   def _validate_persistent_dataset_args(

@@ -765,6 +765,7 @@ class _MultisliceCheckpointManager(
       args: args_lib.Composite,
       *,
       force: bool = False,
+      custom_metadata: Optional[dict[str, Any]] = None,
   ) -> bool:
     """Returns True if a checkpoint was saved either locally or persistently."""
     multihost.sync_global_processes(
@@ -804,7 +805,7 @@ class _MultisliceCheckpointManager(
           self._persistent_checkpoint_manager.directory,
       )
       persistent_saved = self._persistent_checkpoint_manager.save(
-          step, args=args.state, force=force
+          step, args=args.state, force=force, custom_metadata=custom_metadata
       )
     else:
       logging.info(
@@ -822,7 +823,7 @@ class _MultisliceCheckpointManager(
       args = args_lib.Composite(**args_dict)
 
       local_saved = self._local_checkpoint_manager.save(
-          step, args=args, force=force
+          step, args=args, force=force, custom_metadata=custom_metadata
       )
 
     start = time.time()
@@ -1443,6 +1444,7 @@ class CheckpointManager(
       args: args_lib.Composite,
       *,
       force: bool = False,
+      custom_metadata: Optional[dict[str, Any]] = None,
   ) -> bool:
     if _DATASET_ITEM_NAME in args.keys():
       if self._non_replicated_checkpoint_manager is None:
@@ -1452,12 +1454,17 @@ class CheckpointManager(
         )
       else:
         self._non_replicated_checkpoint_manager.save(
-            step, args=args.dataset, force=force
+            step,
+            args=args.dataset,
+            force=force,
+            custom_metadata=custom_metadata,
         )
         args_dict = dict(args.items())
         args_dict.pop(_DATASET_ITEM_NAME)
         args = args_lib.Composite(**args_dict)
-    return self._checkpoint_manager.save(step, args=args, force=force)
+    return self._checkpoint_manager.save(
+        step, args=args, force=force, custom_metadata=custom_metadata
+    )
 
   def restore(
       self,

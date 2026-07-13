@@ -156,8 +156,11 @@ class PersistentCheckpointManager:
       args: p2p_args_lib.Composite,
       *,
       force: bool = False,
+      custom_metadata: dict[str, Any] | None = None,
   ) -> bool:
-    return self._manager.save(step, args=args, force=force)
+    return self._manager.save(
+        step, args=args, force=force, custom_metadata=custom_metadata
+    )
 
   def restore(
       self,

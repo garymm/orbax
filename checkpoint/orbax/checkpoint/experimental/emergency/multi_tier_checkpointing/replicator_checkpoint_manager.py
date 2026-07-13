@@ -397,6 +397,7 @@ class _ReplicatorLocalCheckpointEngine:
       args: args_lib.Composite,
       *,
       force: bool = False,
+      custom_metadata: dict[str, Any] | None = None,
   ) -> bool:
     """Local save path shared by standard and sidecar execution."""
     if not force and not self.should_save(step):
@@ -421,7 +422,9 @@ class _ReplicatorLocalCheckpointEngine:
     dataset_args = args_dict.pop(_DATASET_ITEM_NAME, None)
     args_dict[_PROCESS_METADATA_NAME] = process_metadata_args
     args = args_lib.Composite(**args_dict)
-    saved = self._impl.save(step, args=args, force=force)
+    saved = self._impl.save(
+        step, args=args, force=force, custom_metadata=custom_metadata
+    )
 
     if not saved:
       return False
@@ -436,6 +439,7 @@ class _ReplicatorLocalCheckpointEngine:
               **{_DATASET_ITEM_NAME: dataset_args}
           ),
           force=force,
+          custom_metadata=custom_metadata,
       )
     return True
 
@@ -1033,11 +1037,16 @@ class ReplicatorCheckpointManager(
       args: args_lib.Composite,
       *,
       force: bool = False,
+      custom_metadata: dict[str, Any] | None = None,
   ) -> bool:
     args = self._validate_and_standardize_args(args)
     if self._colocated_controller is not None:
-      return self._colocated_controller.save(step, args, force=force)
-    return self._non_null_local_engine.save(step, args, force=force)
+      return self._colocated_controller.save(
+          step, args, force=force, custom_metadata=custom_metadata
+      )
+    return self._non_null_local_engine.save(
+        step, args, force=force, custom_metadata=custom_metadata
+    )
 
   def _standard_save(
       self,
@@ -1045,9 +1054,12 @@ class ReplicatorCheckpointManager(
       args: args_lib.Composite,
       *,
       force: bool = False,
+      custom_metadata: dict[str, Any] | None = None,
   ) -> bool:
     """Standard (multi-controller) save path."""
-    return self._non_null_local_engine.save(step, args, force=force)
+    return self._non_null_local_engine.save(
+        step, args, force=force, custom_metadata=custom_metadata
+    )
 
   def _get_mesh_consistent_args(
       self,

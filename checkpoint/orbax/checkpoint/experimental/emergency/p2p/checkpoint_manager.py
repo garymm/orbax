@@ -350,15 +350,18 @@ class CheckpointManager(
       args: p2p_args_lib.Composite,
       *,
       force: bool = False,
+      custom_metadata: dict[str, Any] | None = None,
   ) -> bool:
     # mark it stale regardless of result to simplify logics
     self._p2p.mark_registry_stale()
-    p2p_saved = self._local_manager.save(step, args=args, force=force)
+    p2p_saved = self._local_manager.save(
+        step, args=args, force=force, custom_metadata=custom_metadata
+    )
 
     persistent_saved = False
     if self._persistent_manager:
       persistent_saved = self._persistent_manager.save(
-          step, args=args, force=force
+          step, args=args, force=force, custom_metadata=custom_metadata
       )
 
     return p2p_saved or persistent_saved

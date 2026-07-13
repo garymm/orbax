@@ -241,6 +241,7 @@ class LocalCheckpointManager:
       args: p2p_args_lib.Composite,
       *,
       force: bool = False,
+      custom_metadata: dict[str, Any] | None = None,
   ) -> bool:
     """Saves the checkpoint."""
     if utils.pygrain() is not None and constants.DATA_ITER_KEY in args:
@@ -251,7 +252,9 @@ class LocalCheckpointManager:
       )
       args = args_lib.Composite(**args_dict)  # pyrefly: ignore[bad-assignment]
 
-    return self._manager.save(step, args=args, force=force)
+    return self._manager.save(
+        step, args=args, force=force, custom_metadata=custom_metadata
+    )
 
   def restore(
       self,

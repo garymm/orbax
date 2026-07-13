@@ -269,9 +269,9 @@ class ColocatedControllerInternalTest(parameterized.TestCase):
         worker_wait_until_finished=lambda: (  # pylint: disable=unnecessary-lambda
             controller._worker_wait_until_finished()
         ),
-        save_persistent_dataset=lambda step, dataset_args, *, force: (
+        save_persistent_dataset=lambda step, dataset_args, *, force, custom_metadata=None: (
             controller._save_persistent_dataset(
-                step, dataset_args, force=force
+                step, dataset_args, force=force, custom_metadata=custom_metadata
             )
         ),
     )
@@ -720,6 +720,51 @@ class ColocatedControllerInternalTest(parameterized.TestCase):
       self.assertIsNone(controller._pending_save)
       mock_save_dataset.assert_called_once()
 
+  def test_save_propagates_custom_metadata(self):
+    controller, _ = self._make_controller_for_restore()
+    controller._persistent_checkpoint_manager = mock.Mock()
+    state = {'x': jax.device_put(jnp.arange(1, dtype=jnp.int32))}
+    result = jax.device_put(jnp.array(True))
+    custom_metadata = {'lora_rank': 4, 'lora_alpha': 8}
+    dataset_arg = mock.Mock()
+
+    with mock.patch.object(
+        controller, 'should_save', return_value=True
+    ), mock.patch.object(
+        controller, '_prepare_state_for_save', return_value=state
+    ), mock.patch.object(
+        controller, '_get_worker_save_call', return_value=lambda *_: result
+    ), mock.patch.object(
+        controller, '_save_persistent_dataset'
+    ) as mock_save_dataset, mock.patch.object(
+        controller_lib.colocated_utils,
+        'require_unanimous_scalar_result',
+        return_value=True,
+    ), mock.patch.object(
+        controller, '_worker_wait_until_finished'
+    ):
+      saved = controller.save(
+          9,
+          args_lib.Composite(
+              state=args_lib.PyTreeSave(item=state),
+              dataset=dataset_arg,
+          ),
+          custom_metadata=custom_metadata,
+      )
+      self.assertTrue(saved)
+      self.assertIsNotNone(controller._pending_save)
+      assert controller._pending_save is not None
+      self.assertEqual(
+          controller._pending_save.custom_metadata, custom_metadata
+      )
+
+      controller._finish_pending_save()
+
+      self.assertIsNone(controller._pending_save)
+      mock_save_dataset.assert_called_once_with(
+          9, mock.ANY, force=mock.ANY, custom_metadata=custom_metadata
+      )
+
   def test_save_defers_worker_result_until_lifecycle_drain(self):
     controller, _ = self._make_controller_for_restore()
     state = {'x': jax.device_put(jnp.arange(1, dtype=jnp.int32))}
@@ -937,6 +982,7 @@ class ColocatedControllerInternalTest(parameterized.TestCase):
           9,
           args=args_lib.Composite(dataset=dataset_arg),
           force=False,
+          custom_metadata=None,
       )
       self.assertIsNone(controller._pending_save)
 
@@ -1643,6 +1689,7 @@ class ColocatedControllerInternalTest(parameterized.TestCase):
         9,
         args_lib.Composite(dataset=mock.sentinel.dataset),
         force=True,
+        custom_metadata=None,
     )
     mock_worker_in_progress.assert_called_once_with()
     assert controller._pending_save is not None
