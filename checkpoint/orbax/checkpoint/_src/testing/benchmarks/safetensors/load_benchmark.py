@@ -28,6 +28,7 @@ the loaded tree against a previously-captured set and raises on a mismatch.
 
 from __future__ import annotations
 
+import contextlib
 import dataclasses
 import json
 import pprint
@@ -44,14 +45,16 @@ from orbax.checkpoint._src.testing.benchmarks.core import metric as metric_lib
 from orbax.checkpoint._src.testing.benchmarks.core import pytree_utils
 
 
+
 @dataclasses.dataclass(frozen=True)
 class SafetensorLoadBenchmarkOptions(benchmarks_core.BenchmarkOptions):
   """Configuration for loading a HuggingFace-format safetensors checkpoint.
 
   Self-contained: builds its own `ocp.Context()` with the SAFETENSORS layout
   pinned from the load-side tuning knobs, so a single run can sweep e.g.
-  `use_load_and_broadcast` or `restore_concurrent_gb` for A/B comparison. Each
-  knob may be a single value or a list to expand into a parameter sweep.
+  `use_load_and_broadcast`, `restore_concurrent_gb`, or
+  `safetensors_max_over_read_ratio` for A/B comparison. Each knob may be a
+  single value or a list to expand into a parameter sweep.
 
   Attributes:
     checkpoint_path: Path (local or `gs://`) to a directory containing one or
@@ -74,6 +77,17 @@ class SafetensorLoadBenchmarkOptions(benchmarks_core.BenchmarkOptions):
       others instead of every replica reading from storage.
     restore_concurrent_gb: Cap on concurrent read bytes (in GiB); `None` leaves
       the Orbax default.
+    safetensors_max_over_read_ratio: Override for
+      `SafetensorsOptions.max_over_read_ratio`. Bounds per-host cluster egress
+      on strided shardings (inner-dim TP, HSDP). Sweep as `[2.0, 3.0, 4.0]` on a
+      TP variant to measure the read-count vs over-read tradeoff. `None`
+      (default) uses the loader's default (currently 2.0). In-flight read bytes
+      are bounded by `restore_concurrent_gb` (shared with the rest of restore).
+    safetensors_read_chunk_mb: Override for
+      `SafetensorsOptions.read_chunk_bytes`, in MiB. Coalesced blocks are split
+      at this size into concurrent ranged reads; sweep as `[64, 128, 512]` to
+      measure the request-count vs read-parallelism tradeoff on a given storage
+      backend. `None` (default) uses the loader's default (currently 128 MiB).
     metric_tracemalloc_enabled: Whether to capture the tracemalloc metric
       (opt-in because its per-allocation snapshots are expensive).
   """
@@ -84,7 +98,10 @@ class SafetensorLoadBenchmarkOptions(benchmarks_core.BenchmarkOptions):
   reference_digests_path: str | None = None
   use_load_and_broadcast: bool | list[bool] = False
   restore_concurrent_gb: int | None | list[int | None] = None
+  safetensors_max_over_read_ratio: float | None | list[float | None] = None
+  safetensors_read_chunk_mb: int | None | list[int | None] = None
   metric_tracemalloc_enabled: bool = False
+  enable_xprof: bool = False
 
   def is_valid(self) -> bool:
     if self.checkpoint_path is None:
@@ -94,7 +111,15 @@ class SafetensorLoadBenchmarkOptions(benchmarks_core.BenchmarkOptions):
   @property
   def context(self) -> ocp.Context:
     ctx = ocp.Context(
-        checkpoint_layout=ocp.options.CheckpointLayout.SAFETENSORS
+        checkpoint_layout=ocp.options.CheckpointLayout.SAFETENSORS,
+        safetensors_options=ocp.options.SafetensorsOptions(
+            max_over_read_ratio=self.safetensors_max_over_read_ratio,
+            read_chunk_bytes=(
+                self.safetensors_read_chunk_mb * 1024**2
+                if self.safetensors_read_chunk_mb is not None
+                else None
+            ),
+        ),
     )
     # TODO(b/519204863): Fix type hint for args like list[T] | T
     ctx.array.loading.use_load_and_broadcast = self.use_load_and_broadcast
@@ -214,12 +239,18 @@ class SafetensorLoadBenchmark(benchmarks_core.BenchmarksGenerator):
       else:
         abstract_pytree = _replicated_abstract_state(metadata.metadata)
 
+      xprof_session = contextlib.nullcontext()
+
       if load_trace is not None:
         jax.profiler.start_trace(str(load_trace))
-      with metrics.measure("load", metrics_to_measure):
-        restored_pytree = ocp.load(
-            checkpoint_path, abstract_state=abstract_pytree
-        )
+      with xprof_session as url:
+        if url:
+          logging.info("XProf Session URL: %s", url)
+          print(f"\n[XPROF] Session URL: {url}\n")
+        with metrics.measure("load", metrics_to_measure):
+          restored_pytree = ocp.load(
+              checkpoint_path, abstract_state=abstract_pytree
+          )
       if load_trace is not None:
         jax.profiler.stop_trace()
 

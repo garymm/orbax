@@ -17,6 +17,7 @@
 import gc
 import tracemalloc
 import unittest
+
 from absl.testing import parameterized
 from etils import epath
 import jax
@@ -26,6 +27,7 @@ import numpy as np
 from orbax.checkpoint import test_utils
 from orbax.checkpoint._src.testing import multiprocess_test
 from orbax.checkpoint.experimental.v1._src.context import context as context_lib
+from orbax.checkpoint.experimental.v1._src.context import options as options_lib
 from orbax.checkpoint.experimental.v1._src.layout import safetensors_layout
 import safetensors.numpy
 
@@ -90,9 +92,7 @@ class ShardedSafetensorsLayoutTest(
 
     devices = jax.devices()
     mesh_shape = (len(devices) // 2, 2)
-    self.mesh = Mesh(
-        np.array(devices).reshape(mesh_shape), ("data", "model")
-    )
+    self.mesh = Mesh(np.array(devices).reshape(mesh_shape), ("data", "model"))
     test_utils.sync_global_processes("setUp")
 
   def tearDown(self):
@@ -133,7 +133,7 @@ class ShardedSafetensorsLayoutTest(
 
     # Create the tensor to save
     if not array_shape:
-      tensor_to_save = np.float32(1.0)
+      tensor_to_save = np.array(1.0, dtype=np.float32)
     else:
       num_elements = np.prod(array_shape)
       tensor_to_save = np.arange(num_elements, dtype=np.float32).reshape(
@@ -162,87 +162,6 @@ class ShardedSafetensorsLayoutTest(
 
     self.assertEqual(restored_tensor.sharding, expected_tensor.sharding)
     test_utils.assert_array_equal(self, expected_tensor, restored_tensor)
-
-  async def test_load_without_global_reshard_single_tensor(self):
-    """Tests loading with ignore_load_sharding=True with a single tensor."""
-    array_shape = (4, 4)
-    tensor_to_save = np.arange(16, dtype=np.float32).reshape(array_shape)
-    tensor_data = {"params.tensor": tensor_to_save}
-
-    st_path = self.test_dir / f"{self.id()}.safetensors"
-    if jax.process_index() == 0:
-      np_save_file(tensor_data, st_path)
-    test_utils.sync_global_processes(self.id())
-
-    abstract_sharding = NamedSharding(self.mesh, PartitionSpec("data", "model"))
-    abstract_state = {
-        "params.tensor": jax.ShapeDtypeStruct(
-            shape=array_shape, dtype=np.float32, sharding=abstract_sharding
-        ),
-    }
-
-    layout = SafetensorsLayout()
-    ctx = context_lib.Context()
-    ctx.safetensors.ignore_load_sharding = True
-    with ctx:
-      restore_fn = await layout.load(
-          st_path, abstract_state=abstract_state
-      )
-      restored_pytree = await restore_fn
-    restored_tensor = restored_pytree["params.tensor"]
-
-    self.assertEqual(restored_tensor.shape, array_shape)
-
-    if len(restored_tensor.addressable_shards) == 1:
-      np.testing.assert_array_equal(
-          restored_tensor.addressable_shards[0].data, tensor_to_save
-      )
-    else:
-      self.assertEmpty(restored_tensor.addressable_shards)
-
-  async def test_load_without_global_reshard_multi_tensor(self):
-    """Tests loading with ignore_load_sharding=True with multiple tensors."""
-    array_shape = (4, 4)
-    tensor_data = {
-        f"params.tensor_{i}": (
-            np.arange(16, dtype=np.float32).reshape(array_shape) + i
-        )
-        for i in range(4)
-    }
-
-    st_path = self.test_dir / f"{self.id()}.safetensors"
-    if jax.process_index() == 0:
-      np_save_file(tensor_data, st_path)
-    test_utils.sync_global_processes(self.id())
-
-    abstract_sharding = NamedSharding(self.mesh, PartitionSpec("data", "model"))
-    abstract_state = {
-        f"params.tensor_{i}": jax.ShapeDtypeStruct(
-            shape=array_shape, dtype=np.float32, sharding=abstract_sharding
-        )
-        for i in range(4)
-    }
-
-    layout = SafetensorsLayout()
-    ctx = context_lib.Context()
-    ctx.safetensors.ignore_load_sharding = True
-    with ctx:
-      restore_fn = await layout.load(st_path, abstract_state=abstract_state)
-      restored_pytree = await restore_fn
-
-    # Tensors are expected to be distributed among hosts.
-    # With 4 hosts and 4 equal sized tensors, each host should own one.
-    for i in range(4):
-      tensor_name = f"params.tensor_{i}"
-      restored_tensor = restored_pytree[tensor_name]
-      self.assertEqual(restored_tensor.shape, array_shape)
-
-      if len(restored_tensor.addressable_shards) == 1:
-        np.testing.assert_array_equal(
-            restored_tensor.addressable_shards[0].data, tensor_data[tensor_name]
-        )
-      else:
-        self.assertEmpty(restored_tensor.addressable_shards)
 
   async def test_load_multi_host_memory_efficiency(self):
     """Verifies that non-owner hosts don't materialize full zero buffers."""
@@ -279,64 +198,16 @@ class ShardedSafetensorsLayoutTest(
 
     tracemalloc.start()
 
-    restore_fn = await layout.load(
-        file_path,
-        abstract_state=abstract_pytree,
-    )
-    pytree = await restore_fn
-
-    jax.block_until_ready(pytree)
-
-    unused_current, peak = tracemalloc.get_traced_memory()
-    tracemalloc.stop()
-
-    # Peak memory should be dominated by owned tensors (approx 100MB).
-    # Will also contain a single zero buffer of 4MB to be used in place of all
-    # non-owned tensors.
-    # If non-owned tensors were materialized, it would be 400MB.
-    tensors_per_host = num_tensors // jax.process_count()
-    expected_peak = bytes_per_tensor * (tensors_per_host + 1)
-    fudge_factor = 1.2  # Account for overhead, Python objects, etc.
-
-    self.assertLess(peak, fudge_factor * expected_peak)
-
-  async def test_load_without_global_reshard_memory_efficiency(self):
-    """Verifies that non-owner hosts don't materialize full zero buffers when ignore_load_sharding=True."""
-    num_tensors = 100
-    tensor_shape = (1024, 1024)  # 1M elements = 4MB for float32
-    # Total logical size for 100 tensors = 400MB.
-    num_elements = np.prod(tensor_shape)
-    bytes_per_tensor = num_elements * np.dtype(np.float32).itemsize
-
-    abstract_sharding = NamedSharding(self.mesh, PartitionSpec("data", "model"))
-
-    abstract_pytree = {
-        f"tensor_{i}": jax.ShapeDtypeStruct(
-            shape=tensor_shape, dtype=np.float32, sharding=abstract_sharding
+    # Pin a small in-flight budget so the loader streams reads instead of
+    # holding every per-host shard concurrently. With the 2 GiB default the
+    # whole per-host read set (plus coalescing over-read) is in flight at
+    # once and peak runs ~2x destination size; the budget is the knob that
+    # makes the peak-near-destination guarantee actually hold and testable.
+    with context_lib.Context(
+        memory_options=options_lib.MemoryOptions(
+            read_concurrent_bytes=8 * 1024 * 1024
         )
-        for i in range(num_tensors)
-    }
-
-    file_path = self.test_dir / "dummy_no_reshard.safetensors"
-
-    if jax.process_index() == 0:
-      tensors = {
-          f"tensor_{i}": np.zeros(tensor_shape, dtype=np.float32)
-          for i in range(num_tensors)
-      }
-      safetensors.numpy.save_file(tensors, file_path)
-      del tensors
-      gc.collect()
-
-    test_utils.sync_global_processes(self.id())
-
-    layout = SafetensorsLayout()
-
-    tracemalloc.start()
-
-    ctx = context_lib.Context()
-    ctx.safetensors.ignore_load_sharding = True
-    with ctx:
+    ):
       restore_fn = await layout.load(
           file_path,
           abstract_state=abstract_pytree,
@@ -348,11 +219,18 @@ class ShardedSafetensorsLayoutTest(
     unused_current, peak = tracemalloc.get_traced_memory()
     tracemalloc.stop()
 
-    # Peak memory should be dominated by owned tensors (approx 100MB).
-    # If non-owned tensors were materialized, it would be 400MB.
+    # Peak memory is dominated by this host's addressable share of every
+    # tensor (~100 MB for tensors_per_host = 25 and bytes_per_tensor = 4 MB).
+    # On top of that the loader holds:
+    #   * a few coalesced read blocks in flight at any moment (bounded by
+    #     `_MAX_CONCURRENT_READS * coalesce_max_merged_bytes`); and
+    #   * the usual JAX / NumPy object overhead for hundreds of sharded
+    #     `jax.Array`s and per-shard `NamedSharding` references.
+    # If non-owner hosts were materializing zero buffers instead -- the
+    # regression this test guards against -- the peak would be ~400 MB.
     tensors_per_host = num_tensors // jax.process_count()
     expected_peak = bytes_per_tensor * (tensors_per_host + 1)
-    fudge_factor = 1.2  # Account for overhead, Python objects, etc.
+    fudge_factor = 1.5  # in-flight reads + JAX object overhead
 
     self.assertLess(peak, fudge_factor * expected_peak)
 

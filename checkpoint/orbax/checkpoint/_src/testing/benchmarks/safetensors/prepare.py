@@ -190,6 +190,8 @@ def _mirror_to_gcs(local_dir: epath.Path, gcs_uri: str) -> None:
   )
 
 
+
+
 def _write_sharding(
     model_dir: epath.Path, axis_size: int, strategy: str, out: str
 ) -> int:
@@ -232,15 +234,20 @@ _DOWNLOAD_DIR = flags.DEFINE_string(
 flags.mark_flags_as_mutual_exclusive(["repo", "local_dir"], required=True)
 
 
-def main(argv: list[str]) -> None:
-  del argv  # Unused; inputs come from flags.
-  if not _GCS.value and not _SHARDING_OUT.value:
+def _validate_flags() -> None:
+  is_mirroring = bool(_GCS.value)
+  if not is_mirroring and not _SHARDING_OUT.value:
     raise app.UsageError("nothing to do: pass --gcs and/or --sharding_out.")
   if _SHARDING_OUT.value and _AXIS_SIZE.value is None:
     raise app.UsageError("--sharding_out requires --axis_size.")
 
+
+def main(argv: list[str]) -> None:
+  del argv  # Unused; inputs come from flags.
+  _validate_flags()
+
   def _run(model_dir: epath.Path) -> None:
-    if _GCS.value:
+    if _GCS.value and model_dir != epath.Path(_GCS.value):
       print(f">>> Mirroring {model_dir} -> {_GCS.value}")
       _mirror_to_gcs(model_dir, _GCS.value)
     if _SHARDING_OUT.value:
@@ -251,7 +258,7 @@ def main(argv: list[str]) -> None:
 
   if _REPO.value:
     if _DOWNLOAD_DIR.value:
-      dest = epath.Path(_DOWNLOAD_DIR.value) / "safetensors-prepare-model"
+      dest = epath.Path(_DOWNLOAD_DIR.value)
     else:
       model_slug = _REPO.value.replace("/", "--")
       dest = (

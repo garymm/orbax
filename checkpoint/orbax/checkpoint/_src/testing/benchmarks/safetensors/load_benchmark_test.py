@@ -55,6 +55,16 @@ class OptionsTest(absltest.TestCase):
         ocp.options.CheckpointLayout.SAFETENSORS,
     )
 
+  def test_context_maps_safetensors_knobs(self):
+    opts = slb.SafetensorLoadBenchmarkOptions(
+        checkpoint_path="/tmp/x",
+        safetensors_max_over_read_ratio=3.0,
+        safetensors_read_chunk_mb=64,
+    )
+    ctx = opts.context
+    self.assertEqual(ctx.safetensors_options.max_over_read_ratio, 3.0)
+    self.assertEqual(ctx.safetensors_options.read_chunk_bytes, 64 * 1024**2)
+
 
 class GenerationTest(absltest.TestCase):
 

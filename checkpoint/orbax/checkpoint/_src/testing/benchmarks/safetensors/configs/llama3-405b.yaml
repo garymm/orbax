@@ -8,8 +8,11 @@
 #     of byte runs to bin-pack);
 #   * per-host shard sizes are tiny relative to file sizes (4 GB
 #     shards out of 100+ GB files);
-#   * concurrent reads cap (`_MAX_CONCURRENT_READS`) is the active
-#     bottleneck, not bandwidth.
+#   * the byte budget (`max_in_flight_bytes`, default 2 GiB) governs
+#     concurrency by total bytes — so on this tier each read is small
+#     (~4 GB per host, easily within budget) and many reads run
+#     concurrently. Raise the budget on RAM-rich hosts to absorb the
+#     larger coalesced blocks cross-tensor coalescing produces.
 #
 # Llama 3 405B is gated; see safetensor_load_llama3-8b.yaml.
 # GCS pre-staging is *strongly* recommended -- 810 GB download per VM

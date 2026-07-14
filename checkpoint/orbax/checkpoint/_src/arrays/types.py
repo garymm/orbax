@@ -31,6 +31,7 @@ DType = jnp.dtype | np.dtype
 NdSlice = tuple[slice, ...] | type(Ellipsis)
 
 Index = tuple[slice, ...]
+IndexBounds = tuple[tuple[int, int], ...]
 
 
 @dataclasses.dataclass(frozen=True)

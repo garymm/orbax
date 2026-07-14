@@ -20,12 +20,16 @@ jax.distributed.initialize() will be called to set up the distributed system
 using standard environment variables like JAX_COORDINATOR_ADDRESS,
 JAX_PROCESS_ID and JAX_NUM_PROCESSES.
 """
-# pylint: disable=g-statement-before-imports,g-import-not-at-top
+# pylint: disable=g-statement-before-imports,g-import-not-at-top,g-bad-import-order
 
-try:  # SimDevice import must occur before JAX.
-  import simdevice  # pylint: disable=unused-import
-except (ImportError, FileNotFoundError):
-  pass
+import sys
+
+# SimDevice import must occur before JAX only if simulated run is requested.
+if any('simdevice' in arg for arg in sys.argv):
+  try:
+    import simdevice  # pylint: disable=unused-import
+  except (ImportError, FileNotFoundError):
+    pass
 
 import os
 

@@ -31,7 +31,7 @@
 #     new loader's reads should be bounded at 2x ideal, not K x.
 
 suite_name: "safetensor_load_mistral7b_tp"
-num_repeats: 4
+num_repeats: 2
 
 mesh_config:
   mesh_axes: ["tp"]
@@ -41,5 +41,9 @@ benchmarks:
   - generator: "orbax.checkpoint._src.testing.benchmarks.safetensors.load_benchmark.SafetensorLoadBenchmark"
     options:
       checkpoint_path: "gs://orbax-benchmarks/st_fixtures/mistral7b/"
-      sharding_config_path: "gs://orbax-benchmarks/st_fixtures/sharding/mistral7b_tp8.json"
-      enable_trace: true
+      sharding_config_path: "gs://orbax-benchmarks/st_fixtures/sharding/mistral7b_fsdp8.json"
+      enable_trace: false
+      enable_xprof: true
+      # The sweep. Each value becomes a separate run in the dashboard;
+      # the parallel-coordinates view colors them so the curve is visible.
+      safetensors_max_over_read_ratio: [2.0]
