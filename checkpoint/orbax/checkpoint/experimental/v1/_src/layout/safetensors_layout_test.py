@@ -637,6 +637,12 @@ class FileReadTest(unittest.IsolatedAsyncioTestCase, parameterized.TestCase):
     for off, b in zip(offsets, received):
       self.assertEqual(b, self.payload[off : off + 16])
 
+  async def test_delivers_bytes_with_auto_ratio(self):
+    offsets = [0, 1024, 2048]
+    received = await self._run(None, 1 << 20, offsets, [16] * 3)
+    for off, b in zip(offsets, received):
+      self.assertEqual(b, self.payload[off : off + 16])
+
   async def test_delivers_bytes_when_block_splits_into_chunks(self):
     # 5 dense 16-byte runs coalesce into one 80-byte block (ratio 1.0). A
     # 64-byte chunk size splits the block into two reads (64 + 16); the run
@@ -736,48 +742,131 @@ class RecordReadStatsTest(absltest.TestCase):
     self.assertEqual(emitted['/jax/orbax/read/safetensors/storage_reads'], 6.0)
 
 
-class FragmentationWarningTest(parameterized.TestCase):
-  """`_warn_if_reads_fragmented` fires only in the cap-bound strided regime."""
+class AutoOverReadRatioTest(absltest.TestCase):
+  """`_auto_over_read_ratio` picks 1.0 or whole-span from the run geometry."""
 
-  def _stats(self, needed, read, reads):
-    return safetensors_layout._ReadStats(
-        needed_bytes=needed, read_bytes=read, num_reads=reads, num_gets=reads
+  # A stride whose gaps stay above the coalesce floor, so every run is its
+  # own read at ratio 1.0.
+  _STRIDE = 8 + 2 * safetensors_layout._DEFAULT_MIN_COALESCE_GAP
+
+  def test_no_runs(self):
+    self.assertEqual(safetensors_layout._auto_over_read_ratio([]), 1.0)
+
+  def test_few_contiguous_runs_pick_no_over_read(self):
+    # Leading-dim shards: large contiguous slabs, far apart.
+    runs = [(i * (1 << 20), 1 << 18) for i in range(64)]
+    self.assertEqual(safetensors_layout._auto_over_read_ratio(runs), 1.0)
+
+  def test_sub_floor_gaps_count_as_merged(self):
+    # Many tiny runs whose gaps the floor always coalesces -> few effective
+    # reads -> no over-read needed.
+    gap = safetensors_layout._DEFAULT_MIN_COALESCE_GAP
+    runs = [(i * (8 + gap), 8) for i in range(10_000)]
+    self.assertEqual(safetensors_layout._auto_over_read_ratio(runs), 1.0)
+
+  def test_fragmented_runs_pick_whole_span(self):
+    n = safetensors_layout._AUTO_MAX_READS_PER_FILE + 1
+    runs = [(i * self._STRIDE, 8) for i in range(n)]
+    span = (n - 1) * self._STRIDE + 8
+    self.assertEqual(
+        safetensors_layout._auto_over_read_ratio(runs), span / (8 * n)
     )
 
-  def test_warns_when_fragmented_on_default_ratio(self):
-    # 512 reads for 1 file, achieved over-read 1.0x -> the cap is fragmenting.
-    stats = [self._stats(needed=8192, read=8192, reads=512)]
+  def test_read_count_at_cap_picks_no_over_read(self):
+    runs = [
+        (i * self._STRIDE, 8)
+        for i in range(safetensors_layout._AUTO_MAX_READS_PER_FILE)
+    ]
+    self.assertEqual(safetensors_layout._auto_over_read_ratio(runs), 1.0)
+
+  def test_unsorted_runs(self):
+    n = safetensors_layout._AUTO_MAX_READS_PER_FILE + 1
+    runs = [(i * self._STRIDE, 8) for i in reversed(range(n))]
+    span = (n - 1) * self._STRIDE + 8
+    self.assertEqual(
+        safetensors_layout._auto_over_read_ratio(runs), span / (8 * n)
+    )
+
+  def test_auto_ratio_collapses_fragmented_plan(self):
+    # Through the planner: the picked ratio turns a fragmented plan into a
+    # single whole-span block instead of one read per run.
+    n = safetensors_layout._AUTO_MAX_READS_PER_FILE + 1
+    reads = [
+        safetensors_layout._Read(
+            i * self._STRIDE, 8, np.zeros(8, dtype=np.uint8)
+        )
+        for i in range(n)
+    ]
+    _, stats = safetensors_layout._plan_chunk_reads(
+        reads, max_over_read_ratio=None, chunk_bytes=1 << 30
+    )
+    self.assertEqual(stats.num_reads, 1)
+    self.assertEqual(stats.needed_bytes, 8 * n)
+    self.assertEqual(stats.read_bytes, (n - 1) * self._STRIDE + 8)
+
+  def test_auto_ratio_keeps_contiguous_plan_exact(self):
+    # Leading-dim-style slabs stay unmerged: bytes read == bytes needed.
+    reads = [
+        safetensors_layout._Read(
+            i * (1 << 20), 1 << 18, np.zeros(1 << 18, dtype=np.uint8)
+        )
+        for i in range(64)
+    ]
+    _, stats = safetensors_layout._plan_chunk_reads(
+        reads, max_over_read_ratio=None, chunk_bytes=1 << 30
+    )
+    self.assertEqual(stats.num_reads, 64)
+    self.assertEqual(stats.read_bytes, stats.needed_bytes)
+
+
+class OverReadWarningTest(absltest.TestCase):
+  """`_warn_if_over_read` fires only on heavy over-read under the auto ratio."""
+
+  def _stats(self, needed, read):
+    return safetensors_layout._ReadStats(
+        needed_bytes=needed, read_bytes=read, num_reads=1, num_gets=1
+    )
+
+  def test_warns_on_heavy_over_read(self):
+    # Whole-span reads for a fragmenting sharding: 4x the needed bytes.
+    stats = [self._stats(needed=8192, read=32768)]
     with mock.patch.object(safetensors_layout.logging, 'warning') as warn:
-      safetensors_layout._warn_if_reads_fragmented(
-          stats, num_files=1, max_over_read_ratio_is_default=True
+      safetensors_layout._warn_if_over_read(
+          stats, max_over_read_ratio_is_auto=True
       )
     warn.assert_called_once()
 
-  def test_no_warn_when_coalesced(self):
-    # One read per file -> healthy load, no hint.
-    stats = [self._stats(needed=8192, read=8192, reads=1)]
+  def test_no_warn_when_reads_match_needs(self):
+    stats = [self._stats(needed=8192, read=8192)]
     with mock.patch.object(safetensors_layout.logging, 'warning') as warn:
-      safetensors_layout._warn_if_reads_fragmented(
-          stats, num_files=1, max_over_read_ratio_is_default=True
+      safetensors_layout._warn_if_over_read(
+          stats, max_over_read_ratio_is_auto=True
       )
     warn.assert_not_called()
 
-  def test_no_warn_when_over_read_high(self):
-    # Many reads but over-read near the cap -> coalescing happened, not the
-    # fragmented regime.
-    stats = [self._stats(needed=8192, read=16384, reads=512)]
+  def test_no_warn_below_threshold(self):
+    # Gap-floor merges cause mild over-read; not worth a warning.
+    stats = [self._stats(needed=8192, read=9000)]
     with mock.patch.object(safetensors_layout.logging, 'warning') as warn:
-      safetensors_layout._warn_if_reads_fragmented(
-          stats, num_files=1, max_over_read_ratio_is_default=True
+      safetensors_layout._warn_if_over_read(
+          stats, max_over_read_ratio_is_auto=True
       )
     warn.assert_not_called()
 
   def test_no_warn_when_user_set_ratio(self):
     # User already engaged with the knob -> stay quiet.
-    stats = [self._stats(needed=8192, read=8192, reads=512)]
+    stats = [self._stats(needed=8192, read=32768)]
     with mock.patch.object(safetensors_layout.logging, 'warning') as warn:
-      safetensors_layout._warn_if_reads_fragmented(
-          stats, num_files=1, max_over_read_ratio_is_default=False
+      safetensors_layout._warn_if_over_read(
+          stats, max_over_read_ratio_is_auto=False
+      )
+    warn.assert_not_called()
+
+  def test_no_warn_when_nothing_needed(self):
+    stats = [self._stats(needed=0, read=0)]
+    with mock.patch.object(safetensors_layout.logging, 'warning') as warn:
+      safetensors_layout._warn_if_over_read(
+          stats, max_over_read_ratio_is_auto=True
       )
     warn.assert_not_called()
 

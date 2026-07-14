@@ -33,7 +33,6 @@ from orbax.checkpoint.experimental.v1._src.path import types as path_types
 from orbax.checkpoint.experimental.v1._src.serialization import types as serialization_types
 from orbax.checkpoint.experimental.v1._src.tree import types as tree_types
 
-
 FROZEN_IDS: contextvars.ContextVar[frozenset[int]] = contextvars.ContextVar(
     'orbax_frozen_option_ids', default=frozenset()
 )
@@ -606,8 +605,12 @@ class SafetensorsOptions(_ActiveContextGuard):
       coalescing per-host byte runs from one file into a single read. A higher
       value collapses more requests at the cost of more over-read; a value of
       1.0 disables any over-read. Worst-case per-host bytes from one file are
-      bounded at `max_over_read_ratio * ideal_bytes`. `None` selects an
-      implementation default (currently `2.0`).
+      bounded at `max_over_read_ratio * ideal_bytes`. `None` (the default)
+      picks the ratio per file from the planned reads: no over-read when the
+      target sharding already maps to few contiguous ranges, whole-span reads
+      when the plan would otherwise fragment into a very large number of
+      small strided requests (a warning reports the over-read cost of the
+      sharding in that case).
     read_chunk_bytes: Target size of one ranged read. Coalesced blocks are split
       at this size and the pieces are read concurrently, so it trades storage
       request count against read parallelism: larger values issue fewer requests
