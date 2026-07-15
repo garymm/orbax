@@ -24,9 +24,12 @@ reads. This mirrors how the v0 array deserializer
 standing in for TensorStore's chunk index.
 
 Byte runs from every tensor a process needs in one file are coalesced under a
-single bounded-over-read policy: a `max_over_read_ratio` cap on
-`block_size / needed_bytes` keeps cross-host egress from blowing up to
-N x file_size on inner-dim sharding. Each coalesced block is then split at a
+bounded-over-read policy: a `max_over_read_ratio` cap on
+`block_size / needed_bytes`. By default the cap is picked per file from the
+planned runs themselves -- no over-read when the sharding already maps to few
+contiguous reads, whole-span reads when the plan would otherwise fragment
+into a very large number of small strided requests (a warning then reports
+the over-read cost of that sharding). Each coalesced block is then split at a
 fixed chunk size and the chunks are read concurrently, with total in-flight
 bytes bounded by the shared restore budget
 (`MemoryOptions.read_concurrent_bytes`). Peak host memory beyond the
@@ -77,13 +80,13 @@ SAFETENSORS_SUFFIX = ".safetensors"
 # (`max_over_read_ratio`) and the chunk size (`read_chunk_bytes`); the
 # in-flight budget comes from `MemoryOptions.read_concurrent_bytes`.
 #
-# `_DEFAULT_MAX_OVER_READ_RATIO` caps `block_size / needed_bytes` for any
-# coalesced read; a host's bytes pulled from one file are bounded at
-# `ratio * ideal_bytes`. The default trades up to 1x over-read for fewer
-# requests; the row-parallel inner-dim worst case (which would otherwise
-# collapse to "read the whole file on every host") is bounded at 2x and the
-# partitioner emits more, smaller reads instead.
-_DEFAULT_MAX_OVER_READ_RATIO = 2.0
+# With `max_over_read_ratio` unset, each file's ratio is picked from its
+# planned runs (`_auto_over_read_ratio`): 1.0 when coalescing at the gap floor
+# already leaves at most this many reads -- large contiguous shards gain
+# nothing from over-reading -- and the file's `span / needed` otherwise, which
+# collapses a fragmented (strided inner-dim) plan into whole-span reads
+# instead of an unbounded number of small requests.
+_AUTO_MAX_READS_PER_FILE = 1024
 # Always coalesce runs separated by less than this gap, regardless of the
 # over-read ratio. Below roughly a page the per-read overhead -- a syscall
 # locally, an RTT on object storage -- dwarfs the cost of reading the gap, so a
@@ -105,13 +108,12 @@ _DEFAULT_MAX_IN_FLIGHT_BYTES = 2 * 1024 * 1024 * 1024  # 2 GiB
 # streams.
 _DEFAULT_READ_CHUNK_BYTES = 128 * 1024 * 1024  # 128 MiB
 
-# When the over-read cap fragments a load into many small reads -- the strided
-# inner-dim regime -- hint the user toward `max_over_read_ratio`. The warning
-# fires only when reads-per-file exceeds this factor *and* the achieved
-# over-read stayed near 1x (the cap blocked coalescing, rather than the load
-# genuinely spanning many files).
-_FRAGMENTED_READ_WARN_FACTOR = 8
-_FRAGMENTED_OVER_READ_CEILING = 1.2
+# Heavy over-read under the automatic ratio means the target sharding
+# fragments the checkpoint's byte layout and whole spans were read to keep the
+# request count bounded. Surface it so the extra bytes are diagnosable: the
+# sharding, not the loader, is the thing to change. Over-read from gap-floor
+# merges alone stays well below this.
+_OVER_READ_WARN_RATIO = 1.5
 
 
 def _get_dtypes() -> dict[str, Any]:
@@ -378,6 +380,44 @@ def _partition_runs(
   return blocks
 
 
+def _auto_over_read_ratio(runs: Sequence[tuple[int, int]]) -> float:
+  """Picks one file's over-read ratio from its planned run geometry.
+
+  No single ratio suits every sharding. A process reading a few large
+  contiguous runs gains nothing from merging across gaps -- that only
+  wastes bytes. One reading thousands of tiny strided runs is better off
+  reading the whole span, but the ratio where the plan collapses is the
+  file's `span / needed`, which shifts with sharding and topology. Values
+  in between buy more requests *and* more waste, so the choice is binary
+  and the runs themselves decide it.
+
+  Args:
+    runs: `(offset, length)` byte runs planned for one file; need not be sorted.
+      Assumed non-overlapping, as `index_domain_to_byte_runs` produces.
+
+  Returns:
+    `1.0` when merging only sub-floor gaps already leaves at most
+    `_AUTO_MAX_READS_PER_FILE` reads; otherwise the file's whole-span ratio
+    `span / needed`, which bounds every block and collapses uniform strided
+    plans into whole-span reads.
+  """
+  if not runs:
+    return 1.0
+  ordered = sorted(runs)
+  needed = 0
+  num_reads = 1
+  prev_end = ordered[0][0]
+  for offset, length in ordered:
+    needed += length
+    if offset - prev_end > _DEFAULT_MIN_COALESCE_GAP:
+      num_reads += 1
+    prev_end = max(prev_end, offset + length)
+  if num_reads <= _AUTO_MAX_READS_PER_FILE:
+    return 1.0
+  span = prev_end - ordered[0][0]
+  return max(1.0, span / needed)
+
+
 def _replicated_sharding() -> jax.sharding.Sharding:
   """A `NamedSharding` that fully replicates an array across all devices."""
   mesh = jax.sharding.Mesh(np.asarray(jax.devices()), ("_safetensors_replica",))
@@ -427,7 +467,7 @@ class _ReadStats(NamedTuple):
 
 def _plan_chunk_reads(
     reads: Sequence[_Read],
-    max_over_read_ratio: float,
+    max_over_read_ratio: float | None,
     chunk_bytes: int,
 ) -> tuple[list[_ChunkRead], _ReadStats]:
   """Plans the ranged reads serving one file's byte runs.
@@ -442,15 +482,17 @@ def _plan_chunk_reads(
   Args:
     reads: The byte runs to serve, each with its destination buffer.
     max_over_read_ratio: Upper bound on `block_size / needed_bytes` per block.
+      `None` picks the ratio from this file's runs (`_auto_over_read_ratio`).
     chunk_bytes: Maximum size of one ranged read. Must be positive and at most
       the in-flight byte budget, so any single chunk can be reserved.
 
   Returns:
     The chunk reads covering every run, and the file's read accounting.
   """
-  blocks = _partition_runs(
-      [(r.offset, r.length) for r in reads], max_over_read_ratio
-  )
+  runs = [(r.offset, r.length) for r in reads]
+  if max_over_read_ratio is None:
+    max_over_read_ratio = _auto_over_read_ratio(runs)
+  blocks = _partition_runs(runs, max_over_read_ratio)
   chunks: list[_ChunkRead] = []
   for block in blocks:
     members = block.members  # Sorted by run offset (see `_partition_runs`).
@@ -531,7 +573,7 @@ async def _read_file(
     path: Path,
     reads: Sequence[_Read],
     byte_budget: limits.LimitInFlightBytes,
-    max_over_read_ratio: float,
+    max_over_read_ratio: float | None,
     chunk_bytes: int,
 ) -> _ReadStats:
   """Serves all of one file's byte runs with concurrent ranged reads.
@@ -541,6 +583,7 @@ async def _read_file(
     reads: The byte runs this host needs from the file.
     byte_budget: The shared in-flight byte limiter (shared across files).
     max_over_read_ratio: Upper bound on `block_size / needed_bytes` per block.
+      `None` picks the ratio from this file's runs (`_auto_over_read_ratio`).
     chunk_bytes: Maximum size of one ranged read.
 
   Returns:
@@ -716,54 +759,45 @@ def _record_read_stats(stats: Sequence[_ReadStats]) -> None:
   )
 
 
-def _warn_if_reads_fragmented(
+def _warn_if_over_read(
     stats: Sequence[_ReadStats],
-    num_files: int,
-    max_over_read_ratio_is_default: bool,
+    max_over_read_ratio_is_auto: bool,
 ) -> None:
-  """Logs a one-shot hint when the over-read cap fragmented the load.
+  """Logs a one-shot hint when the load read far more bytes than it needed.
 
-  In the strided inner-dim regime the `max_over_read_ratio` cap rejects merges
-  and the load degrades into many small ranged reads -- RTT-bound and slow on
-  object storage. This surfaces that case so a slow load is diagnosable without
-  profiling. It fires once, only on the primary process, and only when the user
-  is on the default ratio (someone who set the knob has already weighed the
-  tradeoff). The signal is a high reads-per-file count together with an achieved
-  over-read near 1x -- exactly "the cap blocked coalescing" rather than "the
-  load genuinely spans many files."
+  Under the automatic per-file ratio, heavy over-read happens only when the
+  target sharding maps to many small strided runs per process and whole spans
+  were read instead to keep the request count bounded. The extra bytes are
+  the cost of that sharding's byte layout, not a loader inefficiency, so the
+  actionable advice is a sharding whose per-process ranges are contiguous.
+  Fires once, only on the primary process, and only for the automatic ratio
+  (someone who set the knob has already weighed the tradeoff).
 
   Args:
     stats: Per-file read accounting from each file's reads.
-    num_files: Number of distinct files the load read from.
-    max_over_read_ratio_is_default: Whether the user left `max_over_read_ratio`
-      unset; only then is "raise the ratio" actionable advice.
+    max_over_read_ratio_is_auto: Whether the user left `max_over_read_ratio`
+      unset (the per-file automatic choice).
   """
-  if not max_over_read_ratio_is_default or num_files == 0:
+  if not max_over_read_ratio_is_auto:
     return
   if multihost.process_index() != 0:
     return
   total_needed = sum(s.needed_bytes for s in stats)
   total_read = sum(s.read_bytes for s in stats)
-  total_reads = sum(s.num_reads for s in stats)
   if total_needed == 0:
     return
-  achieved_over_read = total_read / total_needed
-  if (
-      total_reads <= _FRAGMENTED_READ_WARN_FACTOR * num_files
-      or achieved_over_read >= _FRAGMENTED_OVER_READ_CEILING
-  ):
+  over_read = total_read / total_needed
+  if over_read < _OVER_READ_WARN_RATIO:
     return
   logging.warning(
-      "Safetensors load issued %d ranged reads for %s across %d file(s)"
-      " (achieved over-read %.2fx). The target sharding produces strided reads"
-      " that the default max_over_read_ratio=%.1f keeps fragmented; raising"
-      " SafetensorsOptions.max_over_read_ratio trades bounded over-read for far"
-      " fewer reads (notably faster on object storage).",
-      total_reads,
+      "Safetensors load read %s to serve %s of needed bytes (%.1fx"
+      " over-read). The target sharding needs many small strided ranges per"
+      " process, so whole spans were read instead to keep the request count"
+      " bounded. A sharding whose per-process ranges are contiguous (e.g."
+      " partitioning the leading dimension) avoids the extra bytes.",
+      humanize.naturalsize(total_read, binary=True),
       humanize.naturalsize(total_needed, binary=True),
-      num_files,
-      achieved_over_read,
-      _DEFAULT_MAX_OVER_READ_RATIO,
+      over_read,
   )
 
 
@@ -930,11 +964,6 @@ class SafetensorsLayout(CheckpointLayout):
     """Background load phase: plans reads, reads files, assembles arrays."""
     context = context_lib.get_context()
     opts = context.safetensors_options
-    max_over_read_ratio = (
-        opts.max_over_read_ratio
-        if opts.max_over_read_ratio is not None
-        else _DEFAULT_MAX_OVER_READ_RATIO
-    )
     # In-flight read bytes reuse the shared restore knob,
     # `MemoryOptions.read_concurrent_bytes` (the same limit TensorStore restore
     # uses). `None` means "no limit" there, but the chunk sizing here needs a
@@ -1005,7 +1034,7 @@ class SafetensorsLayout(CheckpointLayout):
           file_path,
           reads_by_file[file_path],
           byte_budget,
-          max_over_read_ratio,
+          opts.max_over_read_ratio,
           chunk_bytes,
       )
       # Drop the read plan so each shard's host memory can be released as
@@ -1017,7 +1046,5 @@ class SafetensorsLayout(CheckpointLayout):
 
     stats = await asyncio.gather(*map(load_file, list(reads_by_file)))
     _record_read_stats(stats)
-    _warn_if_reads_fragmented(
-        stats, len(builds_by_file), opts.max_over_read_ratio is None
-    )
+    _warn_if_over_read(stats, opts.max_over_read_ratio is None)
     return {name: arrays[name] for name in names}
