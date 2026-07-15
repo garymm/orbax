@@ -359,7 +359,7 @@ class CheckpointManagerTestSuite:
           options=options,
       )
 
-      for i in range(total_steps):
+      for i in range(total_steps):  # pyrefly: ignore[bad-argument-type]
         manager.save(
             i,
             args=test_utils.get_composite_save_args(pytree),

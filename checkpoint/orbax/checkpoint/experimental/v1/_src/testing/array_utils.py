@@ -74,7 +74,7 @@ def create_sharded_pytree(
   )
 
   mesh_2d = jax.sharding.Mesh(
-      devices.reshape((slices, num_devices // slices)), ('x', 'y')
+      devices.reshape((slices, num_devices // slices)), ('x', 'y')  # pyrefly: ignore[missing-attribute]
   )
   mesh_axes_2d = jax.sharding.PartitionSpec('x', 'y')
   if replicated_arrays:

@@ -52,8 +52,8 @@ def run_worker_and_command(command):
   # Explicit Initialization
   jax.distributed.initialize(
       coordinator_address=coordinator_address,
-      num_processes=int(num_processes),
-      process_id=int(process_id),
+      num_processes=int(num_processes),  # pyrefly: ignore[bad-argument-type]
+      process_id=int(process_id),  # pyrefly: ignore[bad-argument-type]
   )
 
   print(f"[Rank {process_id}] JAX Initialized. Executing: {' '.join(command)}")

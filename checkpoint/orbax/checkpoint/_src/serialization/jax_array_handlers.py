@@ -1871,7 +1871,7 @@ class SingleReplicaArrayHandler(ArrayHandler):
       )
     else:
       primary_replica_devices = multislice.replica_devices(
-          shardings[0].mesh,
+          shardings[0].mesh,  # pyrefly: ignore[missing-attribute]
           replica_id=self.primary_replica_id,  # pyrefly: ignore[bad-argument-type]
           replica_axis_index=self.replica_axis_index,  # pyrefly: ignore[bad-argument-type]
       ).flatten()

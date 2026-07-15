@@ -226,10 +226,10 @@ def _normalize_index(
 ) -> arrays_types.IndexBounds:
   """Converts a sharding index (tuple of slices/ints) into (start, stop) pairs."""
   resolved = numpy_utils.resolve_slice(index, global_shape)
-  for s in resolved:
+  for s in resolved:  # pyrefly: ignore[not-iterable]
     if s.step not in (None, 1):
       raise ValueError(f"Strided shard index is unsupported: {s}.")
-  return tuple((int(s.start), int(s.stop)) for s in resolved)
+  return tuple((int(s.start), int(s.stop)) for s in resolved)  # pyrefly: ignore[not-iterable]
 
 
 def _byte_strides(global_shape: arrays_types.Shape, itemsize: int) -> list[int]:

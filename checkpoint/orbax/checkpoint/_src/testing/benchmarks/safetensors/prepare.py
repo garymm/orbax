@@ -167,7 +167,7 @@ def _snapshot_download(repo_id: str, dest: epath.Path) -> epath.Path:
         "`pip install huggingface_hub`."
     ) from e
   return epath.Path(
-      hf_hub.snapshot_download(
+      hf_hub.snapshot_download(  # pyrefly: ignore[no-matching-overload]
           repo_id=repo_id,
           local_dir=dest,
           allow_patterns=["*.safetensors", "*.safetensors.index.json"],
@@ -252,7 +252,7 @@ def main(argv: list[str]) -> None:
       _mirror_to_gcs(model_dir, _GCS.value)
     if _SHARDING_OUT.value:
       n = _write_sharding(
-          model_dir, _AXIS_SIZE.value, _STRATEGY.value, _SHARDING_OUT.value
+          model_dir, _AXIS_SIZE.value, _STRATEGY.value, _SHARDING_OUT.value  # pyrefly: ignore[bad-argument-type]
       )
       print(f">>> Wrote {n} tensor entries to {_SHARDING_OUT.value}")
 
@@ -268,7 +268,7 @@ def main(argv: list[str]) -> None:
       )
     _run(_snapshot_download(_REPO.value, dest))
   else:
-    _run(epath.Path(_LOCAL_DIR.value))
+    _run(epath.Path(_LOCAL_DIR.value))  # pyrefly: ignore[bad-argument-type]
 
 
 if __name__ == "__main__":

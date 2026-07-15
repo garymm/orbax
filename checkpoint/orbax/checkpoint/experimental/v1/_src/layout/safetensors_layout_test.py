@@ -458,7 +458,7 @@ class ByteMathHelpersTest(parameterized.TestCase):
   def test_normalize_index_integer(self):
     self.assertEqual(
         safetensors_layout._normalize_index(
-            (2, slice(None, None)), (8, 16)
+            (2, slice(None, None)), (8, 16)  # pyrefly: ignore[bad-argument-type]
         ),  # pytype: disable=wrong-arg-types
         ((2, 3), (0, 16)),
     )

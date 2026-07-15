@@ -291,7 +291,7 @@ def setup_sharded_pytree(
     devices = np.asarray(devices)  # pyrefly: ignore[bad-assignment]
 
   mesh_2d = jax.sharding.Mesh(
-      devices.reshape((2, num_devices // 2)), ('x', 'y')
+      devices.reshape((2, num_devices // 2)), ('x', 'y')  # pyrefly: ignore[missing-attribute]
   )
   mesh_axes_2d = jax.sharding.PartitionSpec('x', 'y')
   mesh_1d = jax.sharding.Mesh(devices, ('x',))  # pyrefly: ignore[bad-argument-type]

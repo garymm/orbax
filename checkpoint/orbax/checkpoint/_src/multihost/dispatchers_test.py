@@ -191,7 +191,7 @@ class ColocatedPythonDispatcherTest(parameterized.TestCase):
     args = type_handlers.ArrayRestoreArgs(sharding=self.arr.sharding)
     converted_args = dispatcher._convert_array_restore_args(args)
     self.assertIsInstance(converted_args.sharding, jax.sharding.NamedSharding)
-    self.mock_cp_devices.assert_called_once_with(args.sharding.mesh)
+    self.mock_cp_devices.assert_called_once_with(args.sharding.mesh)  # pyrefly: ignore[missing-attribute]
 
   def test_convert_array_restore_args_with_sharding_metadata(self):
     dispatcher = dispatchers.ColocatedPythonDispatcher()

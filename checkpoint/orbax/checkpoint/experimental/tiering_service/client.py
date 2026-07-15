@@ -502,7 +502,7 @@ class TieringClient:
     if uuid is not None:
       request.uuid = uuid
     else:
-      request.path = path
+      request.path = path  # pyrefly: ignore[bad-assignment]
 
     if zone is not None:
       request.zone = zone

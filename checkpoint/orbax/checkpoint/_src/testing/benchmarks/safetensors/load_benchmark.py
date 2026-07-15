@@ -113,18 +113,18 @@ class SafetensorLoadBenchmarkOptions(benchmarks_core.BenchmarkOptions):
     ctx = ocp.Context(
         checkpoint_layout=ocp.options.CheckpointLayout.SAFETENSORS,
         safetensors_options=ocp.options.SafetensorsOptions(
-            max_over_read_ratio=self.safetensors_max_over_read_ratio,
+            max_over_read_ratio=self.safetensors_max_over_read_ratio,  # pyrefly: ignore[bad-argument-type]
             read_chunk_bytes=(
-                self.safetensors_read_chunk_mb * 1024**2
+                self.safetensors_read_chunk_mb * 1024**2  # pyrefly: ignore[bad-argument-type]
                 if self.safetensors_read_chunk_mb is not None
                 else None
             ),
         ),
     )
     # TODO(b/519204863): Fix type hint for args like list[T] | T
-    ctx.array.loading.use_load_and_broadcast = self.use_load_and_broadcast
+    ctx.array.loading.use_load_and_broadcast = self.use_load_and_broadcast  # pyrefly: ignore[bad-assignment]
     ctx.memory.read_concurrent_bytes = (
-        self.restore_concurrent_gb * 1024**3
+        self.restore_concurrent_gb * 1024**3  # pyrefly: ignore[bad-assignment]
         if self.restore_concurrent_gb is not None
         else None
     )
