@@ -1,28 +1,28 @@
 load("//devtools/python/blaze:pytype.bzl", "pytype_strict_library", pytype_strict_test = "pytype_strict_contrib_test")
 
+TRANSFORMATIONS_USERS = [
+    "//third_party/py/qwix/google/offline_quantization_example:__pkg__",
+    "//third_party/py/qwix/integration_tests:__pkg__",
+    "//third_party/py/tpu_kernel_testbench:__pkg__",
+]
+
 package(default_visibility = ["//visibility:public"])
 
 py_library(
     name = "renaming",
     srcs = ["renaming.py"],
-    visibility = [
-        "//third_party/py/qwix/integration_tests:__pkg__",
-        "//third_party/py/tpu_kernel_testbench:__pkg__",
-    ],
     deps = [":types"],
 )
 
 py_library(
     name = "fusing",
     srcs = ["fusing.py"],
-    visibility = ["//third_party/py/tpu_kernel_testbench:__pkg__"],
     deps = [":types"],
 )
 
 py_library(
     name = "stacking",
     srcs = ["stacking.py"],
-    visibility = ["//third_party/py/tpu_kernel_testbench:__pkg__"],
     deps = [":types"],
 )
 
@@ -35,10 +35,6 @@ py_library(
 py_library(
     name = "nesting",
     srcs = ["nesting.py"],
-    visibility = [
-        "//third_party/py/qwix/integration_tests:__pkg__",
-        "//third_party/py/tpu_kernel_testbench:__pkg__",
-    ],
     deps = [
         ":types",
         "//checkpoint/orbax/checkpoint/_src/tree:utils",
@@ -48,7 +44,6 @@ py_library(
 py_library(
     name = "repeating",
     srcs = ["repeating.py"],
-    visibility = ["//third_party/py/tpu_kernel_testbench:__pkg__"],
     deps = [":types"],
 )
 
