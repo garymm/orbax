@@ -98,5 +98,42 @@ class StorageBackendDbTest(absltest.TestCase, unittest.IsolatedAsyncioTestCase):
       self.assertIsNone(match_fallback)
 
 
+class StorageBackendPathTest(absltest.TestCase):
+
+  def test_get_storage_path_safe_prefix(self):
+    backend = db_schema.StorageBackend(
+        level=1,
+        backend_type=db_schema.BackendType.BACKEND_TYPE_GCS,
+        prefix="gs://my-bucket",
+    )
+    self.assertEqual(
+        storage_backend.get_storage_path(backend, "gs://my-bucket/file"),
+        "gs://my-bucket/file",
+    )
+    self.assertEqual(
+        storage_backend.get_storage_path(backend, "gs://my-bucket"),
+        "gs://my-bucket",
+    )
+    self.assertEqual(
+        storage_backend.get_storage_path(backend, "gs://my-bucket-2/file"),
+        "gs://my-bucket/gs://my-bucket-2/file",
+    )
+    self.assertEqual(
+        storage_backend.get_storage_path(backend, "file"),
+        "gs://my-bucket/file",
+    )
+
+  def test_get_storage_path_with_trailing_slash(self):
+    backend = db_schema.StorageBackend(
+        level=1,
+        backend_type=db_schema.BackendType.BACKEND_TYPE_GCS,
+        prefix="gs://my-bucket/",
+    )
+    self.assertEqual(
+        storage_backend.get_storage_path(backend, "gs://my-bucket/file"),
+        "gs://my-bucket/file",
+    )
+
+
 if __name__ == "__main__":
   absltest.main()

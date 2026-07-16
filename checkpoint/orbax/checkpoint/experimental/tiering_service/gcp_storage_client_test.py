@@ -14,6 +14,8 @@
 
 """Unit tests for GCP Storage Clients."""
 
+import os
+import tempfile
 import unittest
 from unittest import mock
 import httpx
@@ -46,7 +48,7 @@ class GCPStorageClientTest(unittest.IsolatedAsyncioTestCase):
     super().tearDown()
 
   async def test_gcs_to_gcs_trigger_copy_success(self):
-    client = gcp_storage_client.GcsToGcsClient(project="test-project")
+    client = gcp_storage_client.GcsToGcsTransferClient(project="test-project")
 
     # 1. Mock the first POST call to create transfer job
     mock_post_resp_1 = mock.MagicMock(spec=httpx.Response)
@@ -70,7 +72,7 @@ class GCPStorageClientTest(unittest.IsolatedAsyncioTestCase):
     self.assertEqual(self.mock_client.post.call_count, 2)
 
   async def test_gcs_to_gcs_trigger_copy_sts_fail(self):
-    client = gcp_storage_client.GcsToGcsClient(project="test-project")
+    client = gcp_storage_client.GcsToGcsTransferClient(project="test-project")
 
     mock_post_resp = mock.MagicMock(spec=httpx.Response)
     mock_post_resp.status_code = 400
@@ -86,7 +88,7 @@ class GCPStorageClientTest(unittest.IsolatedAsyncioTestCase):
     self.assertIn("Failed to create Storage Transfer Job", str(ctx.exception))
 
   async def test_gcs_to_gcs_poll_operation_in_progress(self):
-    client = gcp_storage_client.GcsToGcsClient(project="test-project")
+    client = gcp_storage_client.GcsToGcsTransferClient(project="test-project")
 
     mock_get_resp = mock.MagicMock(spec=httpx.Response)
     mock_get_resp.status_code = 200
@@ -109,7 +111,7 @@ class GCPStorageClientTest(unittest.IsolatedAsyncioTestCase):
     self.assertEqual(result.detail_info["total_bytes"], 1000)
 
   async def test_gcs_to_gcs_poll_operation_success(self):
-    client = gcp_storage_client.GcsToGcsClient(project="test-project")
+    client = gcp_storage_client.GcsToGcsTransferClient(project="test-project")
 
     mock_get_resp = mock.MagicMock(spec=httpx.Response)
     mock_get_resp.status_code = 200
@@ -123,7 +125,7 @@ class GCPStorageClientTest(unittest.IsolatedAsyncioTestCase):
     self.assertEqual(result.status, gcp_storage_client.OperationStatus.SUCCESS)
 
   async def test_gcs_to_gcs_poll_operation_failed(self):
-    client = gcp_storage_client.GcsToGcsClient(project="test-project")
+    client = gcp_storage_client.GcsToGcsTransferClient(project="test-project")
 
     mock_get_resp = mock.MagicMock(spec=httpx.Response)
     mock_get_resp.status_code = 200
@@ -226,6 +228,113 @@ class GCPStorageClientTest(unittest.IsolatedAsyncioTestCase):
     )
     self.assertEqual(result.detail_info, {"percent_complete": 42})
 
+  async def test_gcs_delete_path_batch_success(self):
+    """Tests batch chunking limits and multipart HTTP request serialization."""
+    client = gcp_storage_client.GcsClient(project="test-project")
+
+    # 1. Mock list response (150 objects, triggers 2 chunks: 100 and 50)
+    mock_list_resp = mock.MagicMock(spec=httpx.Response)
+    mock_list_resp.status_code = 200
+    mock_list_resp.json.return_value = {
+        "items": [{"name": f"test/dir/file_{i}.txt"} for i in range(150)]
+    }
+    self.mock_client.get.return_value = mock_list_resp
+
+    # 2. Mock batch response content
+    boundary = "dummy_response_boundary"
+
+    # Construct a multipart response with 100 parts for the first chunk, and
+    # 50 parts for the second chunk
+    def make_mock_batch_resp(count: int) -> bytes:
+      parts = []
+      for _ in range(count):
+        parts.append(
+            f"--{boundary}\r\n"
+            "Content-Type: application/http\r\n"
+            "\r\n"
+            "HTTP/1.1 204 No Content\r\n"
+        )
+      parts.append(f"--{boundary}--\r\n")
+      return "".join(parts).encode("utf-8")
+
+    mock_batch_resp_1 = mock.MagicMock(spec=httpx.Response)
+    mock_batch_resp_1.status_code = 200
+    mock_batch_resp_1.headers = {
+        "Content-Type": f"multipart/mixed; boundary={boundary}"
+    }
+    mock_batch_resp_1.content = make_mock_batch_resp(100)
+
+    mock_batch_resp_2 = mock.MagicMock(spec=httpx.Response)
+    mock_batch_resp_2.status_code = 200
+    mock_batch_resp_2.headers = {
+        "Content-Type": f"multipart/mixed; boundary={boundary}"
+    }
+    mock_batch_resp_2.content = make_mock_batch_resp(50)
+
+    self.mock_client.post.side_effect = [mock_batch_resp_1, mock_batch_resp_2]
+
+    # Run delete
+    await client.delete_path("gs://test-bucket/test/dir")
+
+    # Assertions
+    self.mock_client.get.assert_called_once()
+    self.assertEqual(self.mock_client.post.call_count, 2)
+
+    # Check request payload structure of the first post
+    first_call_args = self.mock_client.post.call_args_list[0]
+    called_content = first_call_args.kwargs["content"].decode("utf-8")
+    self.assertIn(
+        "DELETE /storage/v1/b/test-bucket/o/test%2Fdir%2Ffile_0.txt",
+        called_content,
+    )
+    self.assertIn(
+        "DELETE /storage/v1/b/test-bucket/o/test%2Fdir%2Ffile_99.txt",
+        called_content,
+    )
+    self.assertNotIn(
+        "DELETE /storage/v1/b/test-bucket/o/test%2Fdir%2Ffile_100.txt",
+        called_content,
+    )
+
+  async def test_gcs_delete_path_batch_nested_failure(self):
+    """Tests parsing multipart HTTP responses to catch nested API error codes."""
+    client = gcp_storage_client.GcsClient(project="test-project")
+
+    # Mock list response
+    mock_list_resp = mock.MagicMock(spec=httpx.Response)
+    mock_list_resp.status_code = 200
+    mock_list_resp.json.return_value = {
+        "items": [{"name": "test/dir/file_1.txt"}]
+    }
+    self.mock_client.get.return_value = mock_list_resp
+
+    # Mock batch response with a nested 403 Forbidden status
+    boundary = "dummy_response_boundary"
+    response_content = (
+        f"--{boundary}\r\n"
+        "Content-Type: application/http\r\n"
+        "\r\n"
+        "HTTP/1.1 403 Forbidden\r\n"
+        "\r\n"
+        "Permission denied\r\n"
+        f"--{boundary}--\r\n"
+    ).encode("utf-8")
+
+    mock_batch_resp = mock.MagicMock(spec=httpx.Response)
+    mock_batch_resp.status_code = 200
+    mock_batch_resp.headers = {
+        "Content-Type": f"multipart/mixed; boundary={boundary}"
+    }
+    mock_batch_resp.content = response_content
+    self.mock_client.post.return_value = mock_batch_resp
+
+    with self.assertRaisesRegex(
+        RuntimeError,
+        "Batch object deletion failed with nested status: HTTP/1.1 403"
+        " Forbidden",
+    ):
+      await client.delete_path("gs://test-bucket/test/dir")
+
   @mock.patch("google.auth.impersonated_credentials.Credentials")
   async def test_service_account_token_impersonation(
       self, mock_impersonated_creds_class
@@ -235,7 +344,7 @@ class GCPStorageClientTest(unittest.IsolatedAsyncioTestCase):
     mock_imp_creds.token = "impersonated_token"
     mock_impersonated_creds_class.return_value = mock_imp_creds
 
-    client = gcp_storage_client.GcsToGcsClient(
+    client = gcp_storage_client.GcsToGcsTransferClient(
         project="test-project",
         service_account="sa@test.iam.gserviceaccount.com",
     )
@@ -250,6 +359,26 @@ class GCPStorageClientTest(unittest.IsolatedAsyncioTestCase):
         target_principal="sa@test.iam.gserviceaccount.com",
         target_scopes=["https://www.googleapis.com/auth/cloud-platform"],
     )
+
+  async def test_lustre_delete_path_file(self):
+    client = gcp_storage_client.LustreClient()
+    with tempfile.NamedTemporaryFile(delete=False) as f:
+      temp_path = f.name
+
+    self.assertTrue(os.path.exists(temp_path))
+    await client.delete_path(temp_path)
+    self.assertFalse(os.path.exists(temp_path))
+
+  async def test_lustre_delete_path_dir(self):
+    client = gcp_storage_client.LustreClient()
+    temp_dir = tempfile.mkdtemp()
+    temp_file = os.path.join(temp_dir, "file.txt")
+    with open(temp_file, "w") as f:
+      f.write("test")
+
+    self.assertTrue(os.path.exists(temp_file))
+    await client.delete_path(temp_dir)
+    self.assertFalse(os.path.exists(temp_dir))
 
 
 class GCPStorageClientHelpersTest(unittest.TestCase):
@@ -268,7 +397,7 @@ class GCPStorageClientHelpersTest(unittest.TestCase):
     client = gcp_storage_client.determine_client(
         source_tp, target_tp, project="my-proj", service_account="my-sa"
     )
-    self.assertIsInstance(client, gcp_storage_client.GcsToGcsClient)
+    self.assertIsInstance(client, gcp_storage_client.GcsToGcsTransferClient)
     self.assertEqual(client.project, "my-proj")
     self.assertEqual(client.service_account, "my-sa")
 
@@ -354,12 +483,44 @@ class GCPStorageClientHelpersTest(unittest.TestCase):
     with self.assertRaisesRegex(ValueError, "Lustre zone is missing"):
       gcp_storage_client.determine_client(source_tp, target_tp)
 
+  def test_determine_delete_client_gcs(self):
+    tier_path = mock.MagicMock()
+    tier_path.storage_backend.backend_type = (
+        gcp_storage_client.db_schema.BackendType.BACKEND_TYPE_GCS
+    )
+    client = gcp_storage_client.determine_delete_client(
+        tier_path, project="my-proj", service_account="my-sa"
+    )
+    self.assertIsInstance(client, gcp_storage_client.GcsClient)
+    self.assertEqual(client.project, "my-proj")
+    self.assertEqual(client.service_account, "my-sa")
+
+  def test_determine_delete_client_lustre(self):
+    tier_path = mock.MagicMock()
+    tier_path.storage_backend.backend_type = (
+        gcp_storage_client.db_schema.BackendType.BACKEND_TYPE_LUSTRE
+    )
+    client = gcp_storage_client.determine_delete_client(
+        tier_path, project="my-proj", service_account="my-sa"
+    )
+    self.assertIsInstance(client, gcp_storage_client.LustreClient)
+
+  def test_determine_delete_client_invalid_raises(self):
+    tier_path = mock.MagicMock()
+    tier_path.storage_backend.backend_type = (
+        gcp_storage_client.db_schema.BackendType.BACKEND_TYPE_UNSPECIFIED
+    )
+    with self.assertRaisesRegex(
+        ValueError, "Unsupported backend type for delete"
+    ):
+      gcp_storage_client.determine_delete_client(tier_path)
+
   def test_get_client_from_status_gcs_to_gcs(self):
     status = {"client_type": "GcsToGcsClient"}
     client = gcp_storage_client.get_client_from_status(
         status, project="my-proj"
     )
-    self.assertIsInstance(client, gcp_storage_client.GcsToGcsClient)
+    self.assertIsInstance(client, gcp_storage_client.GcsToGcsTransferClient)
     self.assertEqual(client.project, "my-proj")
 
   def test_get_client_from_status_gcs_to_lustre(self):
