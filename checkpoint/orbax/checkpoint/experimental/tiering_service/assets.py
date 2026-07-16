@@ -22,6 +22,7 @@ database models and protobuf messages.
 from collections.abc import Collection, Sequence
 import dataclasses
 import datetime
+import uuid
 
 from absl import logging
 from orbax.checkpoint.experimental.tiering_service import db_schema
@@ -38,6 +39,10 @@ from google.protobuf import timestamp_pb2
 
 class DeletionPendingError(ValueError):
   """Raised when an operation is attempted on an asset/TierPath marked for deletion."""
+
+
+class PrefetchFailedError(ValueError):
+  """Raised when a prefetch operation has failed."""
 
 
 @dataclasses.dataclass
@@ -105,6 +110,10 @@ def _proto_from_db_tier_path(
     expires_at_pb = timestamp_pb2.Timestamp()
     expires_at_pb.FromDatetime(tier_path.expires_at)
 
+  state_val = tier_path.state or db_schema.TierPathState.UNSPECIFIED
+  proto_state_name = f"TIER_PATH_STATE_{state_val.name}"
+  state_pb = tiering_service_pb2.TierPathState.Value(proto_state_name)
+
   return tiering_service_pb2.TierPath(
       id=tier_path.id,
       path=tier_path.path,
@@ -112,6 +121,7 @@ def _proto_from_db_tier_path(
       ready_at=ready_at_pb,
       expires_at=expires_at_pb,
       tier_path_uuid=tier_path.tier_path_uuid,
+      state=state_pb,
   )
 
 
@@ -271,6 +281,9 @@ async def create_or_fetch_asset(
     request: tiering_service_pb2.ReserveRequest,
     backend: db_schema.StorageBackend,
     config: tiering_service_pb2.ServerConfig,
+    *,
+    tier_path_uuid: str,
+    storage_path: str,
 ) -> db_schema.Asset:
   """Creates a new asset or fetches an existing one on unique constraint conflict.
 
@@ -284,6 +297,8 @@ async def create_or_fetch_asset(
     request: The ReserveRequest containing path, user, and tags.
     backend: The StorageBackend to associate the asset with.
     config: The ServerConfig to get the keep-alive interval.
+    tier_path_uuid: The pre-generated UUID for the new TierPath.
+    storage_path: The pre-generated physical storage path.
 
   Returns:
     The created or fetched Asset object.
@@ -302,10 +317,11 @@ async def create_or_fetch_asset(
           )
       ),
   )
-  storage_path = storage_backend_lib.get_storage_path(backend, request.path)
+  backend = await session.merge(backend)
   tier_path = db_schema.TierPath(
       storage_backend=backend,
       path=storage_path,
+      tier_path_uuid=tier_path_uuid,
   )
   db_asset.tier_paths.append(tier_path)
 
@@ -383,6 +399,14 @@ async def finalize_asset(
   Raises:
     ValueError: If the asset is not in ACTIVE_WRITE state.
   """
+  stmt = (
+      select(db_schema.Asset)
+      .where(db_schema.Asset.asset_uuid == db_asset.asset_uuid)
+      .options(sqlalchemy.orm.joinedload(db_schema.Asset.tier_paths))
+  )
+  res = await session.execute(stmt)
+  db_asset = res.scalars().first()
+
   if db_asset.state != db_schema.AssetState.ASSET_STATE_ACTIVE_WRITE:
     raise ValueError(
         f"Asset {db_asset.asset_uuid} is in state {db_asset.state.name}, but"
@@ -396,11 +420,147 @@ async def finalize_asset(
 
   for tier_path in db_asset.tier_paths:
     tier_path.ready_at = now
+    tier_path.state = db_schema.TierPathState.READY
     # TODO: b/503445463 - Set expires_at when policy is supported.
 
   await session.commit()
   await session.refresh(db_asset, attribute_names=["updated_at"])
   return db_asset
+
+
+def find_matching_backend(
+    backends: Sequence[db_schema.StorageBackend],
+    source_backend: db_schema.StorageBackend,
+) -> db_schema.StorageBackend | None:
+  """Finds a storage backend in `backends` that matches `source_backend`.
+
+  The matching logic prioritizes:
+  1. Exact zone match (if both source and target have zone).
+  2. Region match (if they share the same region, or region extracted from
+     zone).
+  3. Multi-regions match (if target has multi_regions containing source's
+     region).
+
+  Args:
+    backends: A list of candidate StorageBackend objects.
+    source_backend: The source StorageBackend object.
+
+  Returns:
+    The matching StorageBackend object, or None if no match is found.
+  """
+
+  def _get_region_from_zone(zone: str) -> str:
+    return zone.rsplit("-", 1)[0]
+
+  # Get source region
+  source_region = None
+  if source_backend.zone:
+    source_region = _get_region_from_zone(source_backend.zone)
+  elif source_backend.region:
+    source_region = source_backend.region
+
+  # 1. Match by zone first (if both have zone)
+  if source_backend.zone:
+    for b in backends:
+      if b.zone and b.zone == source_backend.zone:
+        return b
+
+  # 2. Match by region
+  if source_region:
+    # Try exact region match first
+    for b in backends:
+      if b.region and b.region == source_region:
+        return b
+      if b.zone and _get_region_from_zone(b.zone) == source_region:
+        return b
+
+    # Try multi-regions match
+    for b in backends:
+      if b.multi_regions and source_region in b.multi_regions:
+        return b
+
+  # 3. Handle source having multi_regions (if L0 is multi-regional)
+  if source_backend.multi_regions:
+    # Check if target has region that is in source's multi_regions
+    for b in backends:
+      if b.region and b.region in source_backend.multi_regions:
+        return b
+      if (
+          b.zone
+          and _get_region_from_zone(b.zone) in source_backend.multi_regions
+      ):
+        return b
+      if b.multi_regions:
+        # Check overlap
+        overlap = set(source_backend.multi_regions) & set(b.multi_regions)
+        if overlap:
+          return b
+
+  return None
+
+
+async def trigger_l0_to_l1_copy(
+    session: AsyncSession,
+    db_asset: db_schema.Asset,
+) -> None:
+  """Triggers copying the asset from Level 0 to Level 1 storage.
+
+  We assume always preserve policy, so trigger L0-L1 immediately.
+  Generically calls them L0 and L1 as they are not always Lustre and GCS.
+
+  Args:
+    session: The database session.
+    db_asset: The Asset model instance to copy.
+  """
+  # Find the Level 0 backend from the asset's existing tier paths
+  l0_backend = None
+  for tp in db_asset.tier_paths:
+    if tp.storage_backend.level == 0:
+      l0_backend = tp.storage_backend
+      break
+
+  if l0_backend is None:
+    raise ValueError(f"Asset {db_asset.asset_uuid} has no Level 0 backend.")
+
+  # Look up Level 1 storage backend to queue the copy job
+  stmt = select(db_schema.StorageBackend).where(
+      db_schema.StorageBackend.level == 1
+  )
+  res = await session.execute(stmt)
+  level_1_backends = res.scalars().all()
+
+  l1_backend = find_matching_backend(level_1_backends, l0_backend)
+  if level_1_backends and l1_backend is None:
+    raise ValueError(
+        f"No matching Level 1 backend found for Level 0 backend: {l0_backend}"
+    )
+
+  if l1_backend is not None:
+    l1_tp_uuid = str(uuid.uuid4())
+    l1_path = storage_backend_lib.get_storage_path(
+        l1_backend, db_asset.path, l1_tp_uuid
+    )
+    new_l1_tp = db_schema.TierPath(
+        storage_backend=l1_backend,
+        path=l1_path,
+        tier_path_uuid=l1_tp_uuid,
+        state=db_schema.TierPathState.PENDING,
+    )
+    db_asset.tier_paths.append(new_l1_tp)
+
+    db_job = db_schema.AssetJob(
+        asset_uuid=db_asset.asset_uuid,
+        request_type=db_schema.RequestType.REQUEST_TYPE_COPY,
+        status=db_schema.JobStatus.JOB_STATUS_QUEUED,
+        target_tier_path=new_l1_tp,
+    )
+    session.add(db_job)
+    logging.info(
+        "Finalize: Queued copy job to Level 1 for asset %s, target path: %s",
+        db_asset.asset_uuid,
+        l1_path,
+    )
+    await session.commit()
 
 
 async def is_delete_pending(session: AsyncSession, *, asset_uuid: str) -> bool:
@@ -453,6 +613,7 @@ async def create_prefetch_job(
     *,
     backend: db_schema.StorageBackend,
     storage_path: str,
+    tier_path_uuid: str,
     client_keep_alive_interval: datetime.timedelta,
 ) -> CreatePrefetchJobResult:
   """Queues a prefetch job for the given asset to the target backend.
@@ -468,6 +629,7 @@ async def create_prefetch_job(
     db_asset: The asset to prefetch.
     backend: The target storage backend (level 0).
     storage_path: The storage path to use for the new TierPath.
+    tier_path_uuid: The pre-generated unique identifier for the TierPath.
     client_keep_alive_interval: The interval to set for the initial expires_at
       of the TierPath.
 
@@ -478,6 +640,17 @@ async def create_prefetch_job(
   Raises:
     DeletionPendingError: If the asset is already marked for deletion.
   """
+
+  stmt = (
+      select(db_schema.Asset)
+      .where(db_schema.Asset.asset_uuid == db_asset.asset_uuid)
+      .options(sqlalchemy.orm.joinedload(db_schema.Asset.tier_paths))
+  )
+  res = await session.execute(stmt)
+  db_asset = res.scalars().first()
+
+  if db_asset is None:
+    return CreatePrefetchJobResult(asset=None, created=False)
 
   # Check if there is already a preceding delete job
   if await is_delete_pending(session, asset_uuid=db_asset.asset_uuid):
@@ -494,9 +667,11 @@ async def create_prefetch_job(
       db_asset.asset_uuid,
       backend.id,
   )
+  backend = await session.merge(backend)
   new_tp = db_schema.TierPath(
       storage_backend=backend,
       path=storage_path,
+      tier_path_uuid=tier_path_uuid,
       expires_at=calculate_expires_at(client_keep_alive_interval),
   )
   db_asset.tier_paths.append(new_tp)
@@ -550,12 +725,16 @@ async def prefetch_keep_alive(
     DeletionPendingError: If the asset associated with the TierPath is marked
       for deletion, or if the specific TierPath instance is marked for
       deletion.
+    PrefetchFailedError: If the prefetch operation on the TierPath failed.
   """
   stmt = select(db_schema.TierPath).filter_by(tier_path_uuid=tier_path_uuid)
   result = await session.execute(stmt)
   tp = result.scalars().first()
   if tp is None:
     return None
+
+  if tp.state == db_schema.TierPathState.FAILED:
+    raise PrefetchFailedError(f"Prefetch failed for TierPath {tier_path_uuid}.")
 
   if await is_delete_pending(session, asset_uuid=tp.asset_uuid):
     raise DeletionPendingError(f"Asset {tp.asset_uuid} is marked for deletion.")
@@ -645,3 +824,97 @@ async def queue_delete_asset_job(
   session.add(db_job)  # pyrefly: ignore[missing-attribute]
 
   await session.commit()
+
+
+async def begin_delete_tier_path(
+    session: AsyncSession,
+    tier_path: db_schema.TierPath,
+) -> db_schema.TierPath:
+  """Transitions a tier path state to DELETE_IN_PROCESS and clears read access."""
+  tier_path.state = db_schema.TierPathState.DELETE_IN_PROCESS
+  tier_path.ready_at = None
+  tier_path.expires_at = None
+  session.add(tier_path)  # pyrefly: ignore[missing-attribute]
+  return tier_path
+
+
+async def begin_delete_asset(
+    session: AsyncSession,
+    db_asset: db_schema.Asset,
+) -> db_schema.Asset | None:
+  """Transitions asset state to DELETED and all its tier paths to DELETE_IN_PROCESS."""
+  stmt = (
+      select(db_schema.Asset)
+      .where(db_schema.Asset.asset_uuid == db_asset.asset_uuid)
+      .options(sqlalchemy.orm.joinedload(db_schema.Asset.tier_paths))
+  )
+  res = await session.execute(stmt)
+  db_asset = res.scalars().first()
+
+  if db_asset is None:
+    return None
+
+  db_asset.state = db_schema.AssetState.ASSET_STATE_DELETED
+  db_asset.deleted_at = datetime.datetime.now(datetime.timezone.utc)
+
+  for tp in db_asset.tier_paths:
+    tp.state = db_schema.TierPathState.DELETE_IN_PROCESS
+    tp.ready_at = None
+    tp.expires_at = None
+  return db_asset
+
+
+async def complete_delete_asset(
+    session: AsyncSession,
+    db_asset: db_schema.Asset,
+) -> db_schema.Asset | None:
+  """Transitions asset state to DELETED and marks all tier paths as deleted.
+
+  Args:
+    session: The database session.
+    db_asset: The Asset model instance to delete.
+
+  Returns:
+    The updated Asset object, or None if it was concurrently deleted.
+  """
+  stmt = (
+      select(db_schema.Asset)
+      .where(db_schema.Asset.asset_uuid == db_asset.asset_uuid)
+      .options(sqlalchemy.orm.joinedload(db_schema.Asset.tier_paths))
+  )
+  res = await session.execute(stmt)
+  db_asset = res.scalars().first()
+
+  if db_asset is None:
+    return None
+
+  now = datetime.datetime.now(datetime.timezone.utc)
+  db_asset.state = db_schema.AssetState.ASSET_STATE_DELETED
+  db_asset.deleted_at = now
+
+  for tp in db_asset.tier_paths:
+    tp.state = db_schema.TierPathState.DELETED
+    tp.ready_at = None
+    tp.expires_at = None
+
+  return db_asset
+
+
+async def complete_delete_tier_path(
+    session: AsyncSession,
+    tier_path: db_schema.TierPath,
+) -> db_schema.TierPath:
+  """Transitions a tier path state to DELETED.
+
+  Args:
+    session: The database session.
+    tier_path: The TierPath model instance to update.
+
+  Returns:
+    The updated TierPath object.
+  """
+  tier_path.state = db_schema.TierPathState.DELETED
+  tier_path.ready_at = None
+  tier_path.expires_at = None
+  session.add(tier_path)  # pyrefly: ignore[missing-attribute]
+  return tier_path
