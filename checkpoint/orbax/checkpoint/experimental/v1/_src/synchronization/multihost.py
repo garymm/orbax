@@ -29,6 +29,11 @@ _DEFAULT_BARRIER_TIMEOUT = 300
 
 
 def is_pathways_backend() -> bool:
+  """Checks if a Pathways backend is detected.
+
+  Returns:
+    True if a Pathways (native or proxy) backend is detected, False otherwise.
+  """
   # Pathways is single-host.
   return (
       hasattr(jax.devices()[0].client, 'pathways')
@@ -94,6 +99,11 @@ async def sync_global_processes(
       processes.
     record_event_name: The name of the event to record the duration of the
       synchronization.
+
+  Raises:
+    ValueError: If `timeout` is less than or equal to 0, or if `processes` is
+      provided and the current process index (`process_index()`) is not in
+      `processes`.
   """
   key = f'[op={operation_id}] {key}'
   if should_skip_process_sync(processes):
@@ -149,17 +159,41 @@ async def sync_global_processes(
   )
 
 
-def is_primary_host(primary_host: int | None):
+def is_primary_host(primary_host: int | None) -> bool:
+  """Checks whether the current host is the primary host.
+
+  Args:
+    primary_host: The host id of the primary host. If None, all hosts are
+      considered as primary (`True` is returned).
+
+  Returns:
+    True if `primary_host` is None or equals `process_index()`, False otherwise.
+  """
   if primary_host is None or primary_host == process_index():
     return True
   return False
 
 
 def process_count() -> int:
+  """Returns the number of JAX processes associated with the distributed cluster.
+
+  Returns:
+    The total number of JAX processes (`jax.process_count()`).
+  """
   return jax.process_count()
 
 
 def process_index() -> int:
+  """Returns the unique index of the current JAX process in the cluster.
+
+  When running on distributed backends (non-Pathways), this retrieves the
+  distributed `process_id` (`global_state.process_id`) rather than
+  `jax.process_index()`, which ensures correct barrier coordination across a
+  subset of processes.
+
+  Returns:
+    The integer index of the current process.
+  """
   if is_pathways_backend():
     return jax.process_index()
   # Note that jax.process_index() does not return the same thing as
