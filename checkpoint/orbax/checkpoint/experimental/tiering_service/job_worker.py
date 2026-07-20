@@ -69,6 +69,8 @@ class TieringServiceWorker:
     self._shutdown_event = asyncio.Event()
     self._backends = None
     self._backends_to_try = []
+    self._delete_queue = asyncio.Queue()
+    self._delete_worker_task = None
 
   async def start(self):
     """Starts the background worker loops."""
@@ -89,13 +91,18 @@ class TieringServiceWorker:
     self._backends_to_try.append(None)
     random.shuffle(self._backends_to_try)
 
+    # Start background worker loops.
     self._tasks.append(asyncio.create_task(self._run_acquisition_loop()))
     self._tasks.append(asyncio.create_task(self._run_polling_loop()))
+    self._delete_worker_task = asyncio.create_task(self._run_delete_worker())
+    self._tasks.append(self._delete_worker_task)
 
   async def stop(self):
     """Stops the background worker loops gracefully."""
     logging.info("Stopping TieringServiceWorker...")
     self._shutdown_event.set()
+    if self._delete_worker_task:
+      self._delete_worker_task.cancel()
     if self._tasks:
       # Wait for tasks to finish
       await asyncio.gather(*self._tasks, return_exceptions=True)
@@ -149,12 +156,26 @@ class TieringServiceWorker:
     for job in active_jobs:
       await self._poll_single_job(job, now)
 
-  async def _poll_single_job(
+  async def _extend_delete_job_lease(
       self, job: db_schema.AssetJob, now: datetime.datetime
   ):
-    """Polls a single active copy job and updates its status."""
-    logging.info("Polling job %d", job.id)
+    """Extends the lease for an active background delete job."""
+    async with self._session_maker() as session:  # pyrefly: ignore[not-callable]
+      async with session.begin():
+        merged_job = await session.get(
+            db_schema.AssetJob, job.id, with_for_update=True
+        )
+        if merged_job and (
+            merged_job.status == db_schema.JobStatus.JOB_STATUS_PROCESSING
+            and merged_job.worker_host == self._hostname
+            and merged_job.worker_pid == self._pid
+        ):
+          await self._extend_lease(merged_job, now)
 
+  async def _poll_copy_job_status(
+      self, job: db_schema.AssetJob, now: datetime.datetime
+  ):
+    """Polls the status of an active copy job and updates it in the DB."""
     status_dict = job.transfer_status
     if not status_dict or "request_id" not in status_dict:
       logging.warning("Job %d in PROCESSING but has no request_id", job.id)
@@ -201,6 +222,21 @@ class TieringServiceWorker:
           ):
             merged_job.last_updated_at = now
             session.add(merged_job)
+
+  async def _poll_single_job(
+      self, job: db_schema.AssetJob, now: datetime.datetime
+  ):
+    """Polls a single active copy/delete job and updates its status."""
+    logging.info("Polling job %d", job.id)
+
+    if job.request_type in (
+        db_schema.RequestType.REQUEST_TYPE_DELETE_FROM_INSTANCE,
+        db_schema.RequestType.REQUEST_TYPE_DELETE_FROM_ALL_TIERS,
+    ):
+      await self._extend_delete_job_lease(job, now)
+    else:
+      # a copy job
+      await self._poll_copy_job_status(job, now)
 
   async def _update_job_status_after_poll(
       self,
@@ -311,10 +347,17 @@ class TieringServiceWorker:
 
     if job.request_type == db_schema.RequestType.REQUEST_TYPE_COPY:
       await self._process_copy_job(job)
+    elif job.request_type in (
+        db_schema.RequestType.REQUEST_TYPE_DELETE_FROM_INSTANCE,
+        db_schema.RequestType.REQUEST_TYPE_DELETE_FROM_ALL_TIERS,
+    ):
+      # Synchronously transition paths to DELETE_IN_PROCESS to block reads
+      # instantly before it waits in the delete queue.
+      await self._transition_to_deleting_in_db(job)
+      await self._delete_queue.put(job)
     else:
-      # TODO: b/503445463 - Support DELETE jobs.
       logging.warning("Unsupported job request type: %s", job.request_type)
-      # Mark as failed for now if not COPY
+      # Mark as failed for now if not COPY or DELETE
       async with self._session_maker() as session:  # pyrefly: ignore[not-callable]
         async with session.begin():
           merged_job = await session.get(
@@ -470,7 +513,7 @@ class TieringServiceWorker:
         error_msg=error_msg,
         operation_name=operation_name,
         client_type=determined_client.__class__.__name__,
-        zone=getattr(determined_client, "location", None),
+        zone=getattr(determined_client, "zone", None),
     )
 
   async def _get_target_tier_path(
@@ -542,29 +585,29 @@ class TieringServiceWorker:
     job.expiration_at = None
     session.add(job)  # pyrefly: ignore[missing-attribute]
 
-    # Mark target TierPath as ready
-    target_tp = await self._get_target_tier_path(
-        session, job, load_backend=True
-    )
-    if target_tp:
-      target_tp.state = db_schema.TierPathState.READY
-      target_tp.ready_at = now
-      # Calculate expiration for TierPath if it is Level 0 (Lustre)
-      # "the checkpoint could be removed from this location after it expires."
-      # GCS (Level 1) paths usually don't expire.
-      if (
-          target_tp.storage_backend.backend_type
-          == db_schema.BackendType.BACKEND_TYPE_LUSTRE
-      ):
-        ttl = datetime.timedelta(seconds=60 * 60)
-        target_tp.expires_at = assets.calculate_expires_at(ttl)
-      session.add(target_tp)  # pyrefly: ignore[missing-attribute]
-
-    logging.info(
-        "Completed job %d, target TierPath %s marked ready",
-        job.id,
-        target_tp.path if target_tp else "None",
-    )
+    if job.request_type == db_schema.RequestType.REQUEST_TYPE_COPY:
+      # Mark target TierPath as ready
+      target_tp = await self._get_target_tier_path(
+          session, job, load_backend=True
+      )
+      if target_tp:
+        target_tp.state = db_schema.TierPathState.READY
+        target_tp.ready_at = now
+        # Calculate expiration for TierPath if it is Level 0 (Lustre)
+        # "the checkpoint could be removed from this location after it expires."
+        # GCS (Level 1) paths usually don't expire.
+        if (
+            target_tp.storage_backend.backend_type
+            == db_schema.BackendType.BACKEND_TYPE_LUSTRE
+        ):
+          ttl = datetime.timedelta(seconds=60 * 60)
+          target_tp.expires_at = assets.calculate_expires_at(ttl)
+        session.add(target_tp)  # pyrefly: ignore[missing-attribute]
+      logging.info(
+          "Completed job %d, target TierPath %s marked ready",
+          job.id,
+          target_tp.path if target_tp else "None",
+      )
 
   async def _extend_lease(
       self,
@@ -573,6 +616,225 @@ class TieringServiceWorker:
   ):
     """Extends the lease of the job (heartbeat)."""
     job.expiration_at = now + self._lease_duration
+
+  async def _transition_to_deleting_in_db(self, job: db_schema.AssetJob):
+    """Transitions targeted TierPaths to DELETE_IN_PROCESS state immediately.
+
+    Transition the delete job into DELETE_IN_PROCESS state so that other workers
+    will not attempt to delete again.  In addition, it avoids other readers.
+
+    Args:
+      job: The delete job to transition to DELETE_IN_PROCESS state.
+    """
+    async with self._session_maker() as session:  # pyrefly: ignore[not-callable]
+      async with session.begin():
+        if job.target_tier_path_id:
+          stmt = (
+              select(db_schema.TierPath)
+              .where(db_schema.TierPath.id == job.target_tier_path_id)
+              .with_for_update()
+          )
+          res = await session.execute(stmt)
+          tp = res.scalars().first()
+          if tp:
+            await assets.begin_delete_tier_path(session, tp)
+        else:
+          stmt = (
+              select(db_schema.Asset)
+              .where(db_schema.Asset.asset_uuid == job.asset_uuid)
+              .options(joinedload(db_schema.Asset.tier_paths))
+              .with_for_update()
+          )
+          res = await session.execute(stmt)
+          db_asset = res.scalars().first()
+          if db_asset:
+            await assets.begin_delete_asset(session, db_asset)
+
+  async def _run_delete_worker(self):
+    """Processes enqueued delete jobs sequentially."""
+    while not self._shutdown_event.is_set():
+      try:
+        job = await self._delete_queue.get()
+        try:
+          await self._execute_delete_job(job)
+        finally:
+          self._delete_queue.task_done()
+      except asyncio.CancelledError:
+        break
+      except Exception:  # pylint: disable=broad-except
+        # Log the exception but continue to other delete jobs.
+        logging.exception("Error in background delete worker loop.")
+
+  async def _get_paths_to_delete(
+      self, job: db_schema.AssetJob
+  ) -> list[db_schema.TierPath]:
+    """Fetches tier paths associated with the delete job."""
+    async with self._session_maker() as session:  # pyrefly: ignore[not-callable]
+      if job.target_tier_path_id:
+        stmt = (
+            select(db_schema.TierPath)
+            .where(db_schema.TierPath.id == job.target_tier_path_id)
+            .options(joinedload(db_schema.TierPath.storage_backend))
+        )
+        result = await session.execute(stmt)
+        tp = result.scalars().first()
+        return [tp] if tp else []
+      else:
+        stmt = (
+            select(db_schema.Asset)
+            .where(db_schema.Asset.asset_uuid == job.asset_uuid)
+            .options(
+                joinedload(db_schema.Asset.tier_paths).joinedload(
+                    db_schema.TierPath.storage_backend
+                )
+            )
+        )
+        result = await session.execute(stmt)
+        db_asset = result.scalars().first()
+        return db_asset.tier_paths if db_asset else []
+
+  async def _perform_physical_deletions(
+      self,
+      tier_paths: list[db_schema.TierPath],
+  ) -> None:
+    """Invokes storage clients to delete paths physically."""
+
+    # TODO: b/503445463 - We can improve this by batching multiple delete jobs
+    # altogether.
+    async def _delete_single_path(tp: db_schema.TierPath):
+      client = gcp_storage_client.determine_delete_client(
+          tp,
+          project=self._config.gcp_project or None,
+          service_account=self._config.service_account or None,
+      )
+      try:
+        logging.info(
+            "Deleting path %s using client %s",
+            tp.path,
+            type(client).__name__,
+        )
+        await client.delete_path(tp.path)
+      finally:
+        await client.close()
+
+    tasks = [_delete_single_path(tp) for tp in tier_paths]
+    results = await asyncio.gather(*tasks, return_exceptions=True)
+
+    exceptions = [r for r in results if isinstance(r, Exception)]
+    if exceptions:
+      # Propagate the first error encountered to fail the job
+      raise exceptions[0]
+
+  async def _complete_delete_all_tiers(
+      self,
+      session: AsyncSession,
+      asset_uuid: str,
+  ) -> None:
+    """Completes deletion of all tiers for an asset."""
+    stmt_asset = (
+        select(db_schema.Asset)
+        .where(db_schema.Asset.asset_uuid == asset_uuid)
+        .options(joinedload(db_schema.Asset.tier_paths))
+        .with_for_update()
+    )
+    res_asset = await session.execute(stmt_asset)
+    db_asset = res_asset.scalars().first()
+    logging.info(
+        "DELETE_FROM_ALL_TIERS: db_asset found: %s",
+        str(db_asset is not None),
+    )
+    if db_asset:
+      logging.info(
+          "DELETE_FROM_ALL_TIERS: db_asset %s state before complete: %s",
+          db_asset.asset_uuid,
+          db_asset.state,
+      )
+      await assets.complete_delete_asset(session, db_asset)
+      logging.info(
+          "DELETE_FROM_ALL_TIERS: db_asset %s state after complete: %s",
+          db_asset.asset_uuid,
+          db_asset.state,
+      )
+
+  async def _complete_delete_instances(
+      self,
+      session: AsyncSession,
+      tier_paths: list[db_schema.TierPath],
+  ) -> None:
+    """Completes deletion of specific tier paths."""
+    for tp in tier_paths:
+      stmt_tp = (
+          select(db_schema.TierPath)
+          .where(db_schema.TierPath.id == tp.id)
+          .with_for_update()
+      )
+      res_tp = await session.execute(stmt_tp)
+      db_tp = res_tp.scalars().first()
+      if db_tp:
+        logging.info(
+            "DELETE_FROM_INSTANCE: db_tp %d state before complete: %s",
+            db_tp.id,
+            db_tp.state,
+        )
+        await assets.complete_delete_tier_path(session, db_tp)
+        logging.info(
+            "DELETE_FROM_INSTANCE: db_tp %d state after complete: %s",
+            db_tp.id,
+            db_tp.state,
+        )
+
+  async def _complete_delete_job_db_transition(
+      self,
+      job: db_schema.AssetJob,
+      tier_paths: list[db_schema.TierPath],
+      now: datetime.datetime,
+  ) -> None:
+    """Updates database states for completed deletion job."""
+    async with self._session_maker() as session:  # pyrefly: ignore[not-callable]
+      async with session.begin():
+        merged_job = await session.get(
+            db_schema.AssetJob, job.id, with_for_update=True
+        )
+        if merged_job and (
+            merged_job.status == db_schema.JobStatus.JOB_STATUS_PROCESSING
+            and merged_job.worker_host == self._hostname
+            and merged_job.worker_pid == self._pid
+        ):
+          if (
+              merged_job.request_type
+              == db_schema.RequestType.REQUEST_TYPE_DELETE_FROM_ALL_TIERS
+          ):
+            await self._complete_delete_all_tiers(session, job.asset_uuid)
+          else:
+            await self._complete_delete_instances(session, tier_paths)
+
+          await self._complete_job(session, merged_job, now)
+
+  async def _execute_delete_job(self, job: db_schema.AssetJob):
+    """Executes path deletion in the background and updates DB status."""
+    logging.info("Starting background delete execution for job %d", job.id)
+    now = datetime.datetime.now(datetime.timezone.utc)
+
+    try:
+      # Fetch paths to delete (already in DELETE_IN_PROCESS state)
+      tier_paths = await self._get_paths_to_delete(job)
+      if not tier_paths or any(tp is None for tp in tier_paths):
+        logging.warning("No tier paths found for delete job %d", job.id)
+        await self._fail_job_by_id(job.id, "No paths to delete")
+        return
+
+      # Perform deletions asynchronously
+      await self._perform_physical_deletions(tier_paths)
+
+      # Transition status in database to completed
+      await self._complete_delete_job_db_transition(job, tier_paths, now)
+      logging.info("Successfully completed delete job %d in background", job.id)
+
+    except Exception as e:  # pylint: disable=broad-except
+      logging.exception(
+          "Failed to execute background delete for job %d", job.id
+      )
+      await self._fail_job_by_id(job.id, str(e))
 
 
 async def run_tiering_service_worker_loop(

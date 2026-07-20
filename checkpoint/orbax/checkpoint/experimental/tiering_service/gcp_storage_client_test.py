@@ -155,7 +155,51 @@ class GCPStorageClientTest(unittest.IsolatedAsyncioTestCase):
         destination_path="/lustre/path",
     )
     self.assertEqual(op_name, "operations/import-123")
-    self.mock_client.post.assert_called_once()
+    expected_url = (
+        "https://lustre.googleapis.com/v1/projects/test-project"
+        "/locations/us-central1-a/instances/lustre-1:importData"
+    )
+    expected_json = {
+        "gcsPath": {"uri": "gs://src-bucket/path/"},
+        "lustrePath": {"path": "/lustre/path"},
+        "requestId": "req-1",
+    }
+    self.mock_client.post.assert_called_once_with(
+        expected_url, json=expected_json, headers=mock.ANY
+    )
+
+  async def test_gcs_to_lustre_trigger_copy_with_prefix(self):
+    client = gcp_storage_client.GcsToLustreClient(
+        project="test-project",
+        zone="us-central1-a",
+        instance="lustre-1",
+        prefix="/lustre-mount",
+    )
+
+    mock_post_resp = mock.MagicMock(spec=httpx.Response)
+    mock_post_resp.status_code = 200
+    mock_post_resp.json.return_value = {"name": "operations/import-123"}
+    self.mock_client.post.return_value = mock_post_resp
+
+    op_name = await client.trigger_copy(
+        request_id="req-1",
+        source_path="gs://src-bucket/path",
+        destination_path="/lustre-mount/path/to/dest",
+    )
+    self.assertEqual(op_name, "operations/import-123")
+
+    expected_url = (
+        "https://lustre.googleapis.com/v1/projects/test-project"
+        "/locations/us-central1-a/instances/lustre-1:importData"
+    )
+    expected_json = {
+        "gcsPath": {"uri": "gs://src-bucket/path/"},
+        "lustrePath": {"path": "/path/to/dest"},
+        "requestId": "req-1",
+    }
+    self.mock_client.post.assert_called_once_with(
+        expected_url, json=expected_json, headers=mock.ANY
+    )
 
   async def test_lustre_to_gcs_trigger_copy(self):
     client = gcp_storage_client.LustreToGcsClient(
@@ -173,7 +217,51 @@ class GCPStorageClientTest(unittest.IsolatedAsyncioTestCase):
         destination_path="gs://dest-bucket/path",
     )
     self.assertEqual(op_name, "operations/export-123")
-    self.mock_client.post.assert_called_once()
+    expected_url = (
+        "https://lustre.googleapis.com/v1/projects/test-project"
+        "/locations/us-central1-a/instances/lustre-1:exportData"
+    )
+    expected_json = {
+        "lustrePath": {"path": "/lustre/path"},
+        "gcsPath": {"uri": "gs://dest-bucket/path/"},
+        "requestId": "req-1",
+    }
+    self.mock_client.post.assert_called_once_with(
+        expected_url, json=expected_json, headers=mock.ANY
+    )
+
+  async def test_lustre_to_gcs_trigger_copy_with_prefix(self):
+    client = gcp_storage_client.LustreToGcsClient(
+        project="test-project",
+        zone="us-central1-a",
+        instance="lustre-1",
+        prefix="/lustre-mount",
+    )
+
+    mock_post_resp = mock.MagicMock(spec=httpx.Response)
+    mock_post_resp.status_code = 200
+    mock_post_resp.json.return_value = {"name": "operations/export-123"}
+    self.mock_client.post.return_value = mock_post_resp
+
+    op_name = await client.trigger_copy(
+        request_id="req-1",
+        source_path="/lustre-mount/path/to/src",
+        destination_path="gs://dest-bucket/path",
+    )
+    self.assertEqual(op_name, "operations/export-123")
+
+    expected_url = (
+        "https://lustre.googleapis.com/v1/projects/test-project"
+        "/locations/us-central1-a/instances/lustre-1:exportData"
+    )
+    expected_json = {
+        "lustrePath": {"path": "/path/to/src"},
+        "gcsPath": {"uri": "gs://dest-bucket/path/"},
+        "requestId": "req-1",
+    }
+    self.mock_client.post.assert_called_once_with(
+        expected_url, json=expected_json, headers=mock.ANY
+    )
 
   async def test_lustre_poll_operation_done_success(self):
     client = gcp_storage_client.GcsToLustreClient(

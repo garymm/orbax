@@ -523,6 +523,7 @@ class GcpLustreBaseClient(StorageTransferClient):
       project: str | None = None,
       zone: str | None = None,
       instance: str | None = None,
+      prefix: str | None = None,
       service_account: str | None = None,
   ):
     if not zone or not instance:
@@ -534,6 +535,7 @@ class GcpLustreBaseClient(StorageTransferClient):
         instance=instance,
         service_account=service_account,
     )
+    self.prefix = prefix
 
   async def poll_operation(
       self,
@@ -593,9 +595,15 @@ class GcsToLustreClient(GcpLustreBaseClient):
     # Assets are directories. The Lustre API requires a trailing slash for
     # directory GCS URIs.
     gcs_uri = source_path if source_path.endswith("/") else source_path + "/"
+    lustre_path = destination_path
+    if self.prefix:
+      if lustre_path == self.prefix:
+        lustre_path = "/"
+      elif lustre_path.startswith(self.prefix.rstrip("/") + "/"):
+        lustre_path = lustre_path[len(self.prefix.rstrip("/")) :]
     payload = {
         "gcsPath": {"uri": gcs_uri},
-        "lustrePath": {"path": destination_path},
+        "lustrePath": {"path": lustre_path},
         "requestId": request_id,
     }
     response = await self.async_client.post(url, json=payload, headers=headers)
@@ -630,8 +638,14 @@ class LustreToGcsClient(GcpLustreBaseClient):
         if destination_path.endswith("/")
         else destination_path + "/"
     )
+    lustre_path = source_path
+    if self.prefix:
+      if lustre_path == self.prefix:
+        lustre_path = "/"
+      elif lustre_path.startswith(self.prefix.rstrip("/") + "/"):
+        lustre_path = lustre_path[len(self.prefix.rstrip("/")) :]
     payload = {
-        "lustrePath": {"path": source_path},
+        "lustrePath": {"path": lustre_path},
         "gcsPath": {"uri": gcs_uri},
         "requestId": request_id,
     }
@@ -736,6 +750,7 @@ def _build_lustre_to_gcs(
   return LustreToGcsClient(
       instance=instance,
       zone=lustre_location,
+      prefix=source_tp.storage_backend.prefix,
       project=project,
       service_account=service_account,
   )
@@ -760,6 +775,7 @@ def _build_gcs_to_lustre(
   return GcsToLustreClient(
       instance=instance,
       zone=lustre_location,
+      prefix=target_tp.storage_backend.prefix,
       project=project,
       service_account=service_account,
   )
