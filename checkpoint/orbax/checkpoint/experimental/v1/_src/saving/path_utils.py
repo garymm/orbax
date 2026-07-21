@@ -25,7 +25,6 @@ from orbax.checkpoint.experimental.v1._src.synchronization import multihost
 from orbax.checkpoint.experimental.v1._src.synchronization import synchronization
 
 
-
 def get_temporary_path(
     path: path_types.Path,
     *,
