@@ -13,7 +13,6 @@ orbax.experimental.model API Reference
    model.core.python.polymorphic_function
    model.core.python.shlo_function
    model.core.python.signature
-   model.core.python.tree_util
    model.core.python.type_proto
    model.core.python.unstructured_data
    model.core.python.value
