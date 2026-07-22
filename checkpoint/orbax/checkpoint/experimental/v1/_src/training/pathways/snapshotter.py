@@ -48,6 +48,9 @@ class Snapshotter:
       pinned_state, step = self._queue.get()
       try:
         jax.block_until_ready(pinned_state)
+      except (jax.errors.JaxRuntimeError, RuntimeError) as e:
+        logging.exception("Failed to snapshot state at step %d: %s", step, e)
+      else:
         with self._lock:
           self._latest_snapshot = (pinned_state, step)
       finally:
