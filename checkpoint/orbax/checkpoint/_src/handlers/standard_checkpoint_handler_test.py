@@ -329,23 +329,9 @@ class StandardCheckpointHandlerTestBase(
     )
     test_utils.assert_tree_equal(self, params, restored)
 
-  @parameterized.parameters(
-      (tuple([]),),
-      (dict(),),
-      (list(),),
-  )
-  def test_empty_save(self, tree):
-    self.handler.save(self.directory, args=self.save_args_cls(tree))
-    restored = self.handler.restore(
-        self.directory, args=self.restore_args_cls(tree)
-    )
-    self.assertEqual(restored, tree)
-
-  def test_none_save(self):
-    # Only `None` is unsaveable. Empty containers ({}, [], ()) are stored
-    # successfully as metadata-only entries at the root keypath.
+  def test_empty_error(self):
     with self.assertRaises(ValueError):
-      self.handler.save(self.directory, args=self.save_args_cls(None))
+      self.handler.save(self.directory, args=self.save_args_cls({}))
 
   def test_empty_dict_node(self):
     item = {'a': {}, 'b': 3}

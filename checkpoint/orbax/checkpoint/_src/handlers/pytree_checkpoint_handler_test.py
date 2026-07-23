@@ -987,7 +987,6 @@ class PyTreeCheckpointHandlerTest(
           [],
           [1, [], 2],
           {'a': [], 'b': 3},
-          (),
       ),
       save_args=(
           None,
@@ -1012,11 +1011,8 @@ class PyTreeCheckpointHandlerTest(
     with self.ocdbt_checkpoint_handler(
         use_ocdbt, array_metadata_store=array_metadata_store
     ) as checkpoint_handler:
-      # Only `None` is unsaveable. Empty containers ({}, [], ()) are stored as
-      # a metadata-only entry at the root keypath and restore to the same
-      # empty container.
-      if data is None:
-        with self.assertRaisesRegex(ValueError, 'None is not saveable'):
+      if not data:
+        with self.assertRaisesRegex(ValueError, 'Found empty item'):
           checkpoint_handler.save(
               self.directory,
               args=PyTreeSaveArgs(data, save_args=save_args_tree),
