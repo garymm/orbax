@@ -245,6 +245,27 @@ class StandardNameFormatTest(parameterized.TestCase):
             name_format.find_step(self.directory, step).commit_timestamp_nsecs
         )
 
+  def test_custom_prefix_cvl(self):
+    """Verifies StandardNameFormat works with custom prefixes like 'v=step'."""
+    name_format = step_lib.standard_name_format(
+        step_prefix='v=step', step_format_fixed_length=None
+    )
+    self.assertEqual('v=step_1', name_format.build_name(1))
+
+    # Setup directories
+    (self.directory / 'v=step_1').mkdir()
+    (self.directory / 'v=step_2').mkdir()
+
+    # Test find_step
+    metadata = name_format.find_step(self.directory, 1)
+    self.assertEqual(metadata.step, 1)
+    self.assertEqual(self.directory / 'v=step_1', metadata.path)
+
+    # Test find_all
+    all_metadata = list(name_format.find_all(self.directory))
+    self.assertLen(all_metadata, 2)
+    self.assertEqual({m.step for m in all_metadata}, {1, 2})
+
   @parameterized.parameters(True, False)
   def test_find_step_path_with_uncommitted_checkpoint(self, gcs: bool):
     """Tests for `step.find_step_path(include_uncommitted=True)`."""
